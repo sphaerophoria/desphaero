@@ -27,19 +27,24 @@ const DebugStatus = union(enum) {
 const Debugger = struct {
     const int3 = 0xcc;
 
+    alloc: Allocator,
     exe: [:0]const u8,
     pid: std.posix.pid_t = 0,
 
-    bp: u64 = 0,
-    previous_bp_byte: u8 = 0,
+    breakpoints: std.AutoHashMapUnmanaged(u64, u8) = .{},
 
     regs: c.user_regs_struct = undefined,
     last_signum: i32 = 0,
 
-    pub fn init(exe: [:0]const u8) Debugger {
+    pub fn init(alloc: Allocator, exe: [:0]const u8) Debugger {
         return .{
+            .alloc = alloc,
             .exe = exe,
         };
+    }
+
+    pub fn deinit(self: *Debugger) void {
+        self.breakpoints.deinit(self.alloc);
     }
 
     pub fn launch(self: *Debugger) !void {
@@ -80,26 +85,26 @@ const Debugger = struct {
     }
 
     pub fn cont(self: *Debugger) !void {
-        // Offset by 1 because the int3 instruction has already been hit
-        if (self.regs.rip == self.bp + 1) {
+        if (self.breakpoints.getEntry(self.regs.rip - 1)) |entry| {
             var current_data: u64 = 0;
-            try std.posix.ptrace(std.os.linux.PTRACE.PEEKTEXT, self.pid, self.bp, @intFromPtr(&current_data));
+            try std.posix.ptrace(std.os.linux.PTRACE.PEEKTEXT, self.pid, entry.key_ptr.*, @intFromPtr(&current_data));
 
             std.debug.assert(current_data & 0xff == int3); // Not interrupt
-            swapLeastSignificantByte(&current_data, self.previous_bp_byte);
-            try std.posix.ptrace(std.os.linux.PTRACE.POKETEXT, self.pid, self.bp, current_data);
+
+            swapLeastSignificantByte(&current_data, entry.value_ptr.*);
+            try std.posix.ptrace(std.os.linux.PTRACE.POKETEXT, self.pid, entry.key_ptr.*, current_data);
 
             std.debug.print("Put breakpoint back\n", .{});
 
             var new_regs = self.regs;
-            new_regs.rip = self.bp;
+            new_regs.rip = entry.key_ptr.*;
             try std.posix.ptrace(std.os.linux.PTRACE.SETREGS, self.pid, 0, @intFromPtr(&new_regs));
 
             try std.posix.ptrace(std.os.linux.PTRACE.SINGLESTEP, self.pid, 0, 0);
             _ = try self.wait();
             std.debug.print("New instruction pointer: 0x{x}\n", .{self.regs.rip});
 
-            try self.setBreakpoint(self.bp);
+            try self.setBreakpoint(entry.key_ptr.*);
         }
 
         if (self.last_signum == std.os.linux.SIG.TRAP) {
@@ -110,11 +115,13 @@ const Debugger = struct {
     }
 
     pub fn setBreakpoint(self: *Debugger, address: u64) !void {
-        self.bp = address;
+        const gop = try self.breakpoints.getOrPut(self.alloc, address);
 
         var current_data: u64 = 0;
         try std.posix.ptrace(std.os.linux.PTRACE.PEEKTEXT, self.pid, address, @intFromPtr(&current_data));
-        self.previous_bp_byte = @intCast(current_data & 0xff);
+
+        gop.value_ptr.* = @intCast(current_data & 0xff);
+
         swapLeastSignificantByte(&current_data, int3);
         try std.posix.ptrace(std.os.linux.PTRACE.POKETEXT, self.pid, address, current_data);
     }
@@ -127,7 +134,7 @@ const Debugger = struct {
 
 const Args = struct {
     entry_address: u64,
-    breakpoint_address: u64,
+    breakpoints: []const u64,
     exe: [:0]const u8,
 
     pub fn parse(alloc: Allocator) !Args {
@@ -151,24 +158,27 @@ const Args = struct {
             help(process_name);
         };
 
-        const breakpoint_s = it.next() orelse {
-            print("breakpoint address not provided", .{});
-            help(process_name);
-        };
+        var breakpoints = std.ArrayList(u64).init(alloc);
+        defer breakpoints.deinit();
 
-        const breakpoint = std.fmt.parseInt(u64, breakpoint_s, 0) catch {
-            print("Entry point was not a number\n", .{});
-            help(process_name);
-        };
+        while (it.next()) |breakpoint_s| {
+            const breakpoint = std.fmt.parseInt(u64, breakpoint_s, 0) catch {
+                print("Entry point was not a number\n", .{});
+                help(process_name);
+            };
+
+            try breakpoints.append(breakpoint);
+        }
 
         return .{
             .exe = try alloc.dupeZ(u8, exe),
-            .breakpoint_address = breakpoint,
+            .breakpoints = try breakpoints.toOwnedSlice(),
             .entry_address = entry,
         };
     }
 
     fn deinit(self: *Args, alloc: Allocator) void {
+        alloc.free(self.breakpoints);
         alloc.free(self.exe);
     }
 
@@ -192,7 +202,9 @@ pub fn main() !void {
     var args = try Args.parse(alloc);
     defer args.deinit(alloc);
 
-    var debugger = Debugger.init(args.exe);
+    var debugger = Debugger.init(alloc, args.exe);
+    defer debugger.deinit();
+
     try debugger.launch();
     while (true) {
         const status = try debugger.wait();
@@ -201,7 +213,9 @@ pub fn main() !void {
                 std.debug.print("Stopped at 0x{x}\n", .{info.regs.rip});
                 if (info.regs.rip == args.entry_address) {
                     std.debug.print("Setting up breakpoint\n", .{});
-                    try debugger.setBreakpoint(args.breakpoint_address);
+                    for (args.breakpoints) |breakpoint| {
+                        try debugger.setBreakpoint(breakpoint);
+                    }
                     try debugger.cont();
                 } else {
                     try debugger.cont();
