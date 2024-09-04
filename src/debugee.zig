@@ -1,7 +1,19 @@
 const std = @import("std");
 
+const GlobalVarTracker = enum(u54) {
+    a,
+    b,
+    c,
+};
+
+var my_global_var_pog: usize = 4;
+var my_global_var_2: GlobalVarTracker = .a;
+
 fn doPrintLoop(val: usize) void {
-    std.debug.print("loop iter {d}\n", .{val});
+    const x: i32 = 4 + @as(i32, @intCast(val));
+    const y: i32 = 5 + @as(i32, @intCast(val));
+    my_global_var_pog += 1;
+    std.debug.print("loop iter {d} {d} {d} {d} {any}\n", .{ x, y, val, my_global_var_pog, my_global_var_2 });
 }
 
 fn doPrintLoop2(val: usize) void {

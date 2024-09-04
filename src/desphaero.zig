@@ -4,6 +4,7 @@ const elf = @import("elf.zig");
 const c = @cImport({
     @cInclude("sys/user.h");
 });
+const debuginfo = @import("debuginfo.zig");
 
 fn printPidMaps(alloc: Allocator, pid: std.os.linux.pid_t) void {
     var path_buf: [1024]u8 = undefined;
@@ -15,6 +16,11 @@ fn printPidMaps(alloc: Allocator, pid: std.os.linux.pid_t) void {
     defer alloc.free(maps_data);
 
     std.debug.print("Current maps:\n{s}\n", .{maps_data});
+}
+
+fn addu64i64(a: u64, b: i64) u64 {
+    const b_u: u64 = @bitCast(b);
+    return a +% b_u;
 }
 
 const DebugStatus = union(enum) {
@@ -31,21 +37,44 @@ const Debugger = struct {
     alloc: Allocator,
     exe: [:0]const u8,
     pid: std.posix.pid_t = 0,
+    dwarf_info: debuginfo.DwarfInfo,
 
     breakpoints: std.AutoHashMapUnmanaged(u64, u8) = .{},
 
     regs: c.user_regs_struct = undefined,
     last_signum: i32 = 0,
 
-    pub fn init(alloc: Allocator, exe: [:0]const u8) Debugger {
+    pub fn init(alloc: Allocator, exe: [:0]const u8) !Debugger {
+        var diagnostics = debuginfo.DwarfInfo.Diagnostics{
+            .alloc = alloc,
+        };
+        defer diagnostics.deinit();
+
+        const dwarf_info = try debuginfo.DwarfInfo.init(alloc, exe, &diagnostics);
+
+        if (diagnostics.unhandled_fns.count() > 0) {
+            std.log.warn("Some fns have unhandled IP lookup", .{});
+            var key_it = diagnostics.unhandled_fns.keyIterator();
+
+            var string_buf = std.ArrayList(u8).init(alloc);
+            defer string_buf.deinit();
+            while (key_it.next()) |item| {
+                try string_buf.appendSlice(item.*);
+                try string_buf.appendSlice(", ");
+            }
+            std.log.debug("Function lookup will fail in: {s}", .{string_buf.items});
+        }
+
         return .{
             .alloc = alloc,
             .exe = exe,
+            .dwarf_info = dwarf_info,
         };
     }
 
     pub fn deinit(self: *Debugger) void {
         self.breakpoints.deinit(self.alloc);
+        self.dwarf_info.deinit(self.alloc);
     }
 
     pub fn launch(self: *Debugger) !void {
@@ -95,15 +124,12 @@ const Debugger = struct {
             swapLeastSignificantByte(&current_data, entry.value_ptr.*);
             try std.posix.ptrace(std.os.linux.PTRACE.POKETEXT, self.pid, entry.key_ptr.*, current_data);
 
-            std.debug.print("Put breakpoint back\n", .{});
-
             var new_regs = self.regs;
             new_regs.rip = entry.key_ptr.*;
             try std.posix.ptrace(std.os.linux.PTRACE.SETREGS, self.pid, 0, @intFromPtr(&new_regs));
 
             try std.posix.ptrace(std.os.linux.PTRACE.SINGLESTEP, self.pid, 0, 0);
             _ = try self.wait();
-            std.debug.print("New instruction pointer: 0x{x}\n", .{self.regs.rip});
 
             try self.setBreakpoint(entry.key_ptr.*);
         }
@@ -127,6 +153,28 @@ const Debugger = struct {
         try std.posix.ptrace(std.os.linux.PTRACE.POKETEXT, self.pid, address, current_data);
     }
 
+    pub fn printLocals(self: *Debugger) !void {
+        const die = self.dwarf_info.getDieForInstruction(self.regs.rip);
+        std.debug.print("Hit breakpoint at \x1b[35m0x{x}\x1b[m\nin \x1b[35m{s}\x1b[m\n", .{ self.regs.rip, try die.name() });
+        const locals = try die.getLocals(self.alloc);
+        defer self.alloc.free(locals);
+        for (locals) |local| {
+            switch (local.op) {
+                .fbreg => |v| {
+                    // FIXME: rbp invalid if fomit-frame-pointer
+                    const address = addu64i64(self.regs.rbp, v);
+                    var val: u64 = 0;
+                    try std.posix.ptrace(std.os.linux.PTRACE.PEEKTEXT, self.pid, address, @intFromPtr(&val));
+
+                    std.debug.print("\x1b[34mvar \x1b[35m{s} \x1b[m= {x}\n", .{ local.name, @as(u32, @truncate(val)) });
+                },
+                else => {
+                    std.debug.print("local {s} with unhandled op {any}\n", .{ local.name, local.op });
+                },
+            }
+        }
+    }
+
     fn swapLeastSignificantByte(val: *u64, new_least_sig: u8) void {
         val.* &= ~@as(u64, 0xff);
         val.* |= new_least_sig;
@@ -135,6 +183,7 @@ const Debugger = struct {
 
 const Args = struct {
     breakpoint_names: []const []const u8,
+    breakpoint_offsets: []i64,
     exe: [:0]const u8,
 
     pub fn parse(alloc: Allocator) !Args {
@@ -148,16 +197,32 @@ const Args = struct {
             help(process_name);
         };
 
-        var breakpoints = std.ArrayList([]const u8).init(alloc);
-        defer breakpoints.deinit();
+        var breakpoint_names = std.ArrayList([]const u8).init(alloc);
+        defer breakpoint_names.deinit();
+
+        var breakpoint_offsets = std.ArrayList(i64).init(alloc);
+        defer breakpoint_offsets.deinit();
 
         while (it.next()) |breakpoint_s| {
-            try breakpoints.append(try alloc.dupe(u8, breakpoint_s));
+            try breakpoint_names.append(try alloc.dupe(u8, breakpoint_s));
+
+            const breakpoint_offs_s = it.next() orelse {
+                print("Breakpoint {s} has no offset\n", .{breakpoint_s});
+                help(process_name);
+            };
+
+            const breakpoint_offs = std.fmt.parseInt(i64, breakpoint_offs_s, 0) catch {
+                print("Breakpoint offset {s} is not a valid i64\n", .{breakpoint_offs_s});
+                help(process_name);
+            };
+
+            try breakpoint_offsets.append(breakpoint_offs);
         }
 
         return .{
             .exe = try alloc.dupeZ(u8, exe),
-            .breakpoint_names = try breakpoints.toOwnedSlice(),
+            .breakpoint_names = try breakpoint_names.toOwnedSlice(),
+            .breakpoint_offsets = try breakpoint_offsets.toOwnedSlice(),
         };
     }
 
@@ -165,12 +230,13 @@ const Args = struct {
         for (self.breakpoint_names) |name| {
             alloc.free(name);
         }
+        alloc.free(self.breakpoint_offsets);
         alloc.free(self.breakpoint_names);
         alloc.free(self.exe);
     }
 
     fn help(process_name: []const u8) noreturn {
-        print("Usage: {s} [exe] [entry] [breakpoint]\n", .{process_name});
+        print("Usage: {s} [exe] [<breakpoint name> <breakpoint offs>]...\n", .{process_name});
         std.process.exit(1);
     }
 
@@ -192,7 +258,7 @@ pub fn main() !void {
     var elf_metadata = try elf.getElfMetadata(alloc, args.exe);
     defer elf_metadata.deinit(alloc);
 
-    var debugger = Debugger.init(alloc, args.exe);
+    var debugger = try Debugger.init(alloc, args.exe);
     defer debugger.deinit();
 
     try debugger.launch();
@@ -200,18 +266,21 @@ pub fn main() !void {
         const status = try debugger.wait();
         switch (status) {
             .stopped => |info| {
-                std.debug.print("Stopped at 0x{x}\n", .{info.regs.rip});
                 if (info.regs.rip == elf_metadata.entry) {
                     std.debug.print("Setting up breakpoint\n", .{});
-                    for (args.breakpoint_names) |name| {
+                    for (args.breakpoint_names, 0..) |name, i| {
                         const breakpoint = elf_metadata.fn_addresses.get(name) orelse {
                             std.debug.print("No fn with name {s}\n", .{name});
                             continue;
                         };
-                        try debugger.setBreakpoint(breakpoint);
+
+                        const offs = args.breakpoint_offsets[i];
+
+                        try debugger.setBreakpoint(addu64i64(breakpoint, offs));
                     }
                     try debugger.cont();
                 } else {
+                    try debugger.printLocals();
                     try debugger.cont();
                 }
             },

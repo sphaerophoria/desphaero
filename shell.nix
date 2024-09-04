@@ -13,6 +13,7 @@ pkgs.mkShell {
     gdb
     valgrind
     python3
+    libdwarf
   ];
 }
 
