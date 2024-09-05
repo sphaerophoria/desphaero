@@ -31,10 +31,61 @@ const DwarfAttr = struct {
 
         return ret;
     }
+
+    fn asString(self: *const DwarfAttr) ![]const u8 {
+        var s: [*c]u8 = undefined;
+        const err = libdwarf.dwarf_formstring(self.inner, &s, null);
+
+        if (err != libdwarf.DW_DLV_OK) {
+            return error.NotString;
+        }
+
+        return std.mem.span(s);
+    }
+
+    fn form(self: *const DwarfAttr) !u32 {
+        var ret: libdwarf.Dwarf_Half = undefined;
+        const err = libdwarf.dwarf_whatform(self.inner, &ret, null);
+
+        if (err != libdwarf.DW_DLV_OK) {
+            return error.UnknownForm;
+        }
+
+        return ret;
+    }
+
+    fn asDie(self: *const DwarfAttr, dbg: libdwarf.Dwarf_Debug) !DwarfDie {
+        var offs: libdwarf.Dwarf_Off = undefined;
+        var is_info: c_int = 0;
+        var err = libdwarf.dwarf_formref(self.inner, &offs, &is_info, null);
+
+        if (err != libdwarf.DW_DLV_OK) {
+            return error.NotOffs;
+        }
+
+        var global_offs: libdwarf.Dwarf_Off = undefined;
+        err = libdwarf.dwarf_convert_to_global_offset(self.inner, offs, &global_offs, null);
+        if (err != libdwarf.DW_DLV_OK) {
+            return error.InvalidOffset;
+        }
+
+        var die: libdwarf.Dwarf_Die = undefined;
+        err = libdwarf.dwarf_offdie_b(dbg, global_offs, is_info, &die, null);
+
+        if (err != libdwarf.DW_DLV_OK) {
+            return error.InvalidGlobalOffset;
+        }
+
+        return .{
+            .die = die,
+        };
+    }
 };
 
 pub const Local = struct {
     name: []const u8,
+    type_name: []const u8,
+    type_size: ?u8,
     op: DwOp,
 };
 
@@ -57,7 +108,7 @@ pub const DwarfDie = struct {
         return std.mem.span(text);
     }
 
-    pub fn getLocals(self: *const DwarfDie, alloc: Allocator) ![]Local {
+    pub fn getLocals(self: *const DwarfDie, alloc: Allocator, info: *const DwarfInfo) ![]Local {
         var it = (try self.child()) orelse return &.{};
         errdefer it.deinit();
 
@@ -67,10 +118,24 @@ pub const DwarfDie = struct {
         while (true) {
             const child_tag = try it.tag();
             if (child_tag == libdwarf.DW_TAG_variable) {
-                try out.append(.{
+                const typ_attr = try it.attr(libdwarf.DW_AT_type);
+                const typ = try typ_attr.asDie(info.dbg);
+
+                var local = Local{
                     .name = try it.name(),
+                    .type_name = try typ.name(),
+                    .type_size = null,
                     .op = try DwOp.init(it),
-                });
+                };
+                switch (try typ.tag()) {
+                    libdwarf.DW_TAG_base_type => {
+                        const size_attr = try typ.attr(libdwarf.DW_AT_byte_size);
+                        local.type_size = @truncate(try size_attr.asU64());
+                    },
+                    else => {},
+                }
+
+                try out.append(local);
             }
 
             const next_it = try it.nextSibling();

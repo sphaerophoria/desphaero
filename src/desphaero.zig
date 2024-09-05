@@ -156,7 +156,7 @@ const Debugger = struct {
     pub fn printLocals(self: *Debugger) !void {
         const die = self.dwarf_info.getDieForInstruction(self.regs.rip);
         std.debug.print("Hit breakpoint at \x1b[35m0x{x}\x1b[m\nin \x1b[35m{s}\x1b[m\n", .{ self.regs.rip, try die.name() });
-        const locals = try die.getLocals(self.alloc);
+        const locals = try die.getLocals(self.alloc, &self.dwarf_info);
         defer self.alloc.free(locals);
         for (locals) |local| {
             switch (local.op) {
@@ -166,7 +166,12 @@ const Debugger = struct {
                     var val: u64 = 0;
                     try std.posix.ptrace(std.os.linux.PTRACE.PEEKTEXT, self.pid, address, @intFromPtr(&val));
 
-                    std.debug.print("\x1b[34mvar \x1b[35m{s} \x1b[m= {x}\n", .{ local.name, @as(u32, @truncate(val)) });
+                    if (local.type_size) |size| {
+                        const mask = ~@as(u64, 0) >> @intCast((8 - size) * 8);
+                        val = val & mask;
+                    }
+
+                    std.debug.print("\x1b[34mvar \x1b[35m{s}\x1b[m: {s} ({any}) = {x}\n", .{ local.name, local.type_name, local.type_size, val });
                 },
                 else => {
                     std.debug.print("local {s} with unhandled op {any}\n", .{ local.name, local.op });
