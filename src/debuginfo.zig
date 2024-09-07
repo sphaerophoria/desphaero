@@ -3,8 +3,8 @@ const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 const elf = @import("elf.zig");
 const libdwarf = @cImport({
-    @cInclude("libdwarf-0/dwarf.h");
-    @cInclude("libdwarf-0/libdwarf.h");
+    @cInclude("dwarf.h");
+    @cInclude("libdwarf.h");
 });
 
 fn tagString(tag: libdwarf.Dwarf_Half) []const u8 {
@@ -142,9 +142,12 @@ const DwarfAttr = struct {
 
     fn asAddr(self: *const DwarfAttr) !u64 {
         var ret: libdwarf.Dwarf_Addr = undefined;
-        const err = libdwarf.dwarf_formaddr(self.inner, &ret, null);
+        var err_string: libdwarf.Dwarf_Error = undefined;
+        const err = libdwarf.dwarf_formaddr(self.inner, &ret, &err_string);
 
         if (err != libdwarf.DW_DLV_OK) {
+            //defer libdwarf.dwarf_dealloc_error(err_string);
+            std.log.err("{s}", .{libdwarf.dwarf_errmsg(err_string)});
             return error.NotAddr;
         }
 
@@ -157,6 +160,21 @@ const DwarfAttr = struct {
 
         if (err != libdwarf.DW_DLV_OK) {
             return error.NotU64;
+        }
+
+        return ret;
+    }
+
+    fn asGlobalOffs(self: *const DwarfAttr) !u64 {
+        var ret: libdwarf.Dwarf_Addr = undefined;
+        var err_string: libdwarf.Dwarf_Error = undefined;
+        var is_info: c_int = undefined;
+        const err = libdwarf.dwarf_global_formref_b(self.inner, &ret, &is_info, &err_string);
+
+        if (err != libdwarf.DW_DLV_OK) {
+            //defer libdwarf.dwarf_dealloc_error(err_string);
+            std.log.err("{s}", .{libdwarf.dwarf_errmsg(err_string)});
+            return error.NotAddr;
         }
 
         return ret;
@@ -182,6 +200,18 @@ const DwarfAttr = struct {
         }
 
         return ret;
+    }
+
+    fn asRef(self: *const DwarfAttr) !u64 {
+        var offs: libdwarf.Dwarf_Off = undefined;
+        var is_info: c_int = 0;
+        const err = libdwarf.dwarf_formref(self.inner, &offs, &is_info, null);
+
+        if (err != libdwarf.DW_DLV_OK) {
+            return error.NotOffs;
+        }
+
+        return offs;
     }
 
     fn asDie(self: *const DwarfAttr, dbg: libdwarf.Dwarf_Debug) !DwarfDie {
@@ -335,16 +365,16 @@ pub const DwarfDie = struct {
     }
 };
 
-const CompilationUnitIt = struct {
+pub const CompilationUnitIt = struct {
     dbg: *libdwarf.Dwarf_Debug,
 
-    fn init(dbg: *libdwarf.Dwarf_Debug) !CompilationUnitIt {
+    pub fn init(dbg: *libdwarf.Dwarf_Debug) !CompilationUnitIt {
         return .{
             .dbg = dbg,
         };
     }
 
-    fn next(self: *CompilationUnitIt) !?DwarfDie {
+    pub fn next(self: *CompilationUnitIt) !?DwarfDie {
         var die: libdwarf.Dwarf_Die = undefined;
 
         const ret = libdwarf.dwarf_next_cu_header_e(
@@ -619,7 +649,7 @@ const DwarfIt = struct {
     }
 };
 
-fn dwarfDbgFromPath(exe: [:0]const u8) !libdwarf.Dwarf_Debug {
+pub fn dwarfDbgFromPath(exe: [:0]const u8) !libdwarf.Dwarf_Debug {
     var dbg: libdwarf.Dwarf_Debug = undefined;
 
     const ret = libdwarf.dwarf_init_path(exe, null, 0, libdwarf.DW_GROUPNUMBER_ANY, null, null, &dbg, null);
@@ -769,4 +799,124 @@ fn upperBound(
     }
 
     return left;
+}
+
+const LineNumberProgramHeader32 = struct {
+    unit_length: u32,
+    version: u16,
+    header_length: u32,
+    minimum_instruction_length: u8,
+    maximum_operations_per_instruction: u8,
+    default_is_stmt: u8,
+    line_base: i8,
+    line_range: u8,
+    opcode_base: u8,
+    standard_opcode_lengths: []u64,
+    include_directories: [][]const u8,
+    file_names: []FileName,
+
+    fn init(alloc: Allocator, reader: anytype) !LineNumberProgramHeader32 {
+        const unit_length = try reader.readInt(u32, .little);
+        std.debug.assert(unit_length < 0xfffffff0);
+
+        const version = try reader.readInt(u16, .little);
+        const header_length = try reader.readInt(u32, .little);
+        const minimum_instruction_length = try reader.readInt(u8, .little);
+        const maximum_operations_per_instruction = try reader.readInt(u8, .little);
+        const line_base = try reader.readInt(i8, .little);
+        const line_range = try reader.readInt(u8, .little);
+        const default_is_stmt = try reader.readInt(u8, .little);
+        const opcode_base = try reader.readInt(u8, .little);
+        var standard_opcode_lengths = std.ArrayList(u64).init(alloc);
+        defer standard_opcode_lengths.deinit();
+
+        for (1..opcode_base - 1) |_| {
+            const val = try std.leb.readULEB128(u64, reader);
+            try standard_opcode_lengths.append(val);
+        }
+
+        var include_directories = std.ArrayList([]const u8).init(alloc);
+        defer include_directories.deinit();
+        while (true) {
+            const p = try reader.readUntilDelimiterAlloc(alloc, 0, 1_000_000);
+            if (p.len == 0) {
+                break;
+            }
+            try include_directories.append(p);
+        }
+
+        var file_names = std.ArrayList(FileName).init(alloc);
+        defer file_names.deinit();
+        while (true) {
+            const f = try FileName.init(alloc, reader) orelse break;
+            try file_names.append(f);
+        }
+
+        return .{
+            .unit_length = unit_length,
+            .version = version,
+            .header_length = header_length,
+            .minimum_instruction_length = minimum_instruction_length,
+            .maximum_operations_per_instruction = maximum_operations_per_instruction,
+            .default_is_stmt = default_is_stmt,
+            .line_base = line_base,
+            .line_range = line_range,
+            .opcode_base = opcode_base,
+            .standard_opcode_lengths = try standard_opcode_lengths.toOwnedSlice(),
+            .include_directories = try include_directories.toOwnedSlice(),
+            .file_names = try file_names.toOwnedSlice(),
+        };
+    }
+
+    const FileName = struct {
+        name: []const u8,
+        dir_idx: u64,
+        mtime: u64,
+        size: u64,
+
+        fn init(alloc: Allocator, reader: anytype) !?FileName {
+            const p = try reader.readUntilDelimiterAlloc(alloc, 0, 1_000_000);
+            if (p.len == 0) {
+                return null;
+            }
+
+            return .{
+                .name = p,
+                .dir_idx = try std.leb.readULEB128(u64, reader),
+                .mtime = try std.leb.readULEB128(u64, reader),
+                .size = try std.leb.readULEB128(u64, reader),
+            };
+
+        }
+    };
+
+};
+pub fn lineProgramExperiment(alloc: Allocator) !void {
+    const path = "./zig-out/bin/debugee";
+    var dbg = try dwarfDbgFromPath("./zig-out/bin/debugee");
+    var cu_it = try CompilationUnitIt.init(&dbg);
+
+    const first_cu = try cu_it.next() orelse return error.NoCu;
+    var stmt_list_attr = try first_cu.attr(libdwarf.DW_AT_stmt_list);
+    defer stmt_list_attr.deinit();
+
+    const stmt_list_offs = try stmt_list_attr.asGlobalOffs();
+    std.debug.print("TU has line offs: 0x{x}\n", .{stmt_list_offs});
+    var elf_metadata = try elf.getElfMetadata(alloc, path);
+    defer elf_metadata.deinit(alloc);
+
+    const debug_line = elf_metadata.di.sections[@intFromEnum(std.dwarf.DwarfSection.debug_line)].?.data;
+    const prog = debug_line;
+
+    var fbr = std.io.fixedBufferStream(prog);
+    const reader = fbr.reader();
+
+    const header = try LineNumberProgramHeader32.init(alloc, reader);
+
+
+    for (header.file_names) |f| {
+
+        std.debug.print("{s}\n", .{f.name});
+        std.debug.print("{d}\n", .{f.dir_idx});
+    }
 }

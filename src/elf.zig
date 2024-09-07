@@ -166,6 +166,7 @@ pub fn getElfMetadata(alloc: Allocator, path: []const u8) !ElfMetadata {
             const section_data = try alloc.alloc(u8, shdr.sh_size);
             errdefer alloc.free(section_data);
 
+            std.debug.print("section_name: {s}, offs: 0x{x}\n", .{section_name, shdr.sh_offset});
             try f.seekTo(shdr.sh_offset);
             _ = try f.readAll(section_data);
 
