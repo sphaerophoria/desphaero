@@ -162,6 +162,18 @@ const DwarfAttr = struct {
         return ret;
     }
 
+    fn asGlobalOffs(self: *const DwarfAttr) !u64 {
+        var ret: libdwarf.Dwarf_Addr = undefined;
+        var is_info: c_int = undefined;
+        const err = libdwarf.dwarf_global_formref_b(self.inner, &ret, &is_info, null);
+
+        if (err != libdwarf.DW_DLV_OK) {
+            return error.NotAddr;
+        }
+
+        return ret;
+    }
+
     fn asString(self: *const DwarfAttr) ![]const u8 {
         var s: [*c]u8 = undefined;
         const err = libdwarf.dwarf_formstring(self.inner, &s, null);
@@ -630,15 +642,120 @@ fn dwarfDbgFromPath(exe: [:0]const u8) !libdwarf.Dwarf_Debug {
     return dbg;
 }
 
+const DieRange = struct {
+    start: u64,
+    end: u64,
+};
+
+const CompilationUnits = struct {
+    const CompilationUnitRange = struct { range: DieRange, die: u32 };
+    ranges: []CompilationUnitRange,
+    compilation_unit_dies: []DwarfDie,
+
+    const Builder = struct {
+        alloc: Allocator,
+        ranges: std.ArrayListUnmanaged(CompilationUnitRange) = .{},
+        compilation_unit_dies: std.ArrayListUnmanaged(DwarfDie) = .{},
+
+        pub fn deinit(self: *Builder) void {
+            self.ranges.deinit(self.alloc);
+            self.compilation_unit_dies.deinit(self.alloc);
+        }
+
+        pub fn push(self: *Builder, die: DwarfDie) !usize {
+            try self.compilation_unit_dies.append(self.alloc, die);
+            return self.compilation_unit_dies.items.len - 1;
+        }
+
+        pub fn pushRange(self: *Builder, range: DieRange, idx: u32) !void {
+            if (range.start == 0 and range.end == 0) {
+                return;
+            }
+
+            try self.ranges.append(self.alloc, .{
+                .range = range,
+                .die = idx,
+            });
+        }
+
+        pub fn build(self: *Builder) !CompilationUnits {
+            sortRanges(self.ranges.items);
+            try mergeSortedRanges(self.alloc, &self.ranges);
+
+            return .{
+                .ranges = try self.ranges.toOwnedSlice(self.alloc),
+                .compilation_unit_dies = try self.compilation_unit_dies.toOwnedSlice(self.alloc),
+            };
+        }
+
+        fn sortRanges(ranges: []CompilationUnitRange) void {
+            const fnLessThan = struct {
+                fn f(_: void, lhs: CompilationUnitRange, rhs: CompilationUnitRange) bool {
+                    return lhs.range.start < rhs.range.start;
+                }
+            }.f;
+
+            std.sort.pdq(CompilationUnitRange, ranges, {}, fnLessThan);
+        }
+
+        fn mergeSortedRanges(alloc: Allocator, ranges: *std.ArrayListUnmanaged(CompilationUnitRange)) !void {
+            var squashed_ranges = std.ArrayListUnmanaged(CompilationUnitRange){};
+            defer squashed_ranges.deinit(alloc);
+
+            for (ranges.items) |item| {
+                if (squashed_ranges.items.len > 0) {
+                    const last = &squashed_ranges.items[squashed_ranges.items.len - 1];
+                    if (last.die == item.die) {
+                        last.range.end = item.range.end;
+                        continue;
+                    }
+                }
+
+                try squashed_ranges.append(alloc, item);
+            }
+
+            std.mem.swap(@TypeOf(ranges.*), ranges, &squashed_ranges);
+        }
+    };
+
+    pub fn deinit(self: *CompilationUnits, alloc: Allocator) void {
+        alloc.free(self.ranges);
+        for (self.compilation_unit_dies) |die| {
+            die.deinit();
+        }
+        alloc.free(self.compilation_unit_dies);
+    }
+
+    pub fn getForIp(self: *const CompilationUnits, instruction_pointer: u64) DwarfDie {
+        const itemLessThan = struct {
+            fn f(_: void, lhs: u64, rhs: CompilationUnitRange) bool {
+                return lhs < rhs.range.start;
+            }
+        }.f;
+
+        const upper = upperBound(CompilationUnitRange, instruction_pointer, self.ranges, {}, itemLessThan);
+
+        const range = self.ranges[upper -| 1];
+        return self.compilation_unit_dies[range.die];
+    }
+};
+
+pub const SourceLocation = struct {
+    path: []const u8,
+    line: i32,
+
+    pub fn deinit(self: *SourceLocation, alloc: Allocator) void {
+        alloc.free(self.path);
+    }
+};
+
 pub const DwarfInfo = struct {
     dbg: libdwarf.Dwarf_Debug,
     functions: []Function,
+    compilation_units: CompilationUnits,
 
     const Function = struct {
-        range: struct {
-            start: u64,
-            end: u64,
-        },
+        range: DieRange,
         die: DwarfDie,
     };
 
@@ -677,8 +794,12 @@ pub const DwarfInfo = struct {
         var functions = std.ArrayList(Function).init(alloc);
         defer functions.deinit();
 
+        var compilation_units = CompilationUnits.Builder{ .alloc = alloc };
+        defer compilation_units.deinit();
+
         while (try dwarf_it.next()) |item| {
             const die = item.die;
+
             switch (try die.tag()) {
                 // FIXME: DW_TAG_inlined_subroutine + DW_TAG_entry_point
                 libdwarf.DW_TAG_subprogram => {
@@ -707,6 +828,39 @@ pub const DwarfInfo = struct {
                         .die = die,
                     });
                 },
+                libdwarf.DW_TAG_compile_unit => {
+                    const die_idx = try compilation_units.push(die);
+
+                    var dw_return_realoffset: libdwarf.Dwarf_Off = undefined;
+                    var dw_rangesbuf: ?[*]libdwarf.Dwarf_Ranges = undefined;
+                    var dw_rangecount: libdwarf.Dwarf_Signed = undefined;
+                    var dw_bytecount: libdwarf.Dwarf_Unsigned = undefined;
+
+                    var ranges_attr = try die.attr(libdwarf.DW_AT_ranges);
+                    defer ranges_attr.deinit();
+
+                    const err = libdwarf.dwarf_get_ranges_b(
+                        dbg,
+                        try ranges_attr.asGlobalOffs(),
+                        die.die,
+                        &dw_return_realoffset,
+                        &dw_rangesbuf,
+                        &dw_rangecount,
+                        &dw_bytecount,
+                        null,
+                    );
+
+                    if (err != libdwarf.DW_DLV_OK) {
+                        return error.ErrorGettingRanges;
+                    }
+
+                    for (0..@as(usize, @intCast(dw_rangecount))) |i| {
+                        try compilation_units.pushRange(.{
+                            .start = dw_rangesbuf.?[i].dwr_addr1,
+                            .end = dw_rangesbuf.?[i].dwr_addr2,
+                        }, @intCast(die_idx));
+                    }
+                },
                 else => {
                     die.deinit();
                 },
@@ -724,6 +878,7 @@ pub const DwarfInfo = struct {
         return .{
             .dbg = dbg,
             .functions = try functions.toOwnedSlice(),
+            .compilation_units = try compilation_units.build(),
         };
     }
 
@@ -731,6 +886,7 @@ pub const DwarfInfo = struct {
         for (self.functions) |f| {
             f.die.deinit();
         }
+        self.compilation_units.deinit(alloc);
         alloc.free(self.functions);
         _ = libdwarf.dwarf_finish(self.dbg);
     }
@@ -746,7 +902,57 @@ pub const DwarfInfo = struct {
 
         return &self.functions[upper -| 1].die;
     }
+
+    pub fn sourceLocation(self: *const DwarfInfo, alloc: Allocator, instruction_pointer: u64, debug_line: []const u8) !SourceLocation {
+        const cu_die = self.compilation_units.getForIp(instruction_pointer);
+
+        var stmt_list_attr = try cu_die.attr(libdwarf.DW_AT_stmt_list);
+        defer stmt_list_attr.deinit();
+
+        const stmt_list_offs = try stmt_list_attr.asGlobalOffs();
+        const prog = debug_line[stmt_list_offs..];
+
+        var fbr = std.io.fixedBufferStream(prog);
+        const reader = fbr.reader();
+
+        var lpm = try lineProgramMachine(alloc, reader);
+        defer lpm.deinit(alloc);
+
+        const best_match = try findMatchingSnapshot(&lpm, instruction_pointer);
+        const file_path = try resolveLpmPath(alloc, cu_die, lpm.header, best_match.file);
+        errdefer alloc.free(file_path);
+        return .{
+            .path = file_path,
+            .line = best_match.line,
+        };
+    }
+
+    fn resolveLpmPath(alloc: Allocator, cu_die: DwarfDie, header: LineNumberProgramHeader, file_idx: usize) ![]const u8 {
+        const file_info = header.file_names[file_idx - 1];
+        const dir_name = if (file_info.dir_idx > 0) blk: {
+            break :blk header.include_directories[file_info.dir_idx - 1];
+        } else blk: {
+            var attr = try cu_die.attr(libdwarf.DW_AT_comp_dir);
+            defer attr.deinit();
+
+            break :blk try attr.asString();
+        };
+
+        return try std.fs.path.join(alloc, &.{ dir_name, file_info.name });
+    }
 };
+
+fn findMatchingSnapshot(lpm: anytype, instruction_pointer: u64) !@TypeOf(lpm.*).Snapshot {
+    var best_match_addr: u64 = 0;
+    var best_match: @TypeOf(lpm.*).Snapshot = undefined;
+    while (try lpm.next()) |item| {
+        if (best_match_addr < item.address and item.address <= instruction_pointer) {
+            best_match_addr = item.address;
+            best_match = item;
+        }
+    }
+    return best_match;
+}
 
 // NOTE: upperBound API cannot handle mis-matched types in 0.13 (I think, didn't actually check but pretty sure)
 fn upperBound(
@@ -769,4 +975,387 @@ fn upperBound(
     }
 
     return left;
+}
+
+// FIXME: Detect if we're in 32 or 64 bit mode
+// FIXME: We probably don't actually need this, we can prune fields that we
+// don't care about
+const LineNumberProgramHeader = struct {
+    unit_length: u32,
+    // FIXME: Surely we should do something with this
+    version: u16,
+    header_length: u32,
+    minimum_instruction_length: u8,
+    maximum_operations_per_instruction: u8,
+    default_is_stmt: u8,
+    line_base: i8,
+    line_range: u8,
+    opcode_base: u8,
+    // FIXME: Should we do something with this?
+    standard_opcode_lengths: []u64,
+    include_directories: [][]const u8,
+    file_names: []FileName,
+    in_header_bytes: usize,
+
+    fn init(alloc: Allocator, in_reader: anytype) !LineNumberProgramHeader {
+        const unit_length = try in_reader.readInt(u32, .little);
+
+        // Only 32 bit header parsing is implemented
+        // Only 32 bit header parsing with small unit lengths implemented
+        std.debug.assert(unit_length < 0xfffffff0);
+
+        var counting_reader = std.io.countingReader(in_reader);
+        const reader = counting_reader.reader();
+
+        const version = try reader.readInt(u16, .little);
+        // FIXME: Validate read length matches header length
+        const header_length = try reader.readInt(u32, .little);
+        const minimum_instruction_length = try reader.readInt(u8, .little);
+        const maximum_operations_per_instruction = try reader.readInt(u8, .little);
+        const default_is_stmt = try reader.readInt(u8, .little);
+        const line_base = try reader.readInt(i8, .little);
+        const line_range = try reader.readInt(u8, .little);
+        const opcode_base = try reader.readInt(u8, .little);
+
+        const standard_opcode_lengths = try readStandardOpcodeLengths(alloc, opcode_base, reader);
+        errdefer alloc.free(standard_opcode_lengths);
+
+        const include_directories = try readIncludeDirectories(alloc, reader);
+        errdefer deinitIncludeDirs(alloc, include_directories);
+
+        const file_names = try readFileNames(alloc, reader);
+        errdefer deinitFileNames(file_names);
+
+        return .{
+            .unit_length = unit_length,
+            .version = version,
+            .header_length = header_length,
+            .minimum_instruction_length = minimum_instruction_length,
+            .maximum_operations_per_instruction = maximum_operations_per_instruction,
+            .default_is_stmt = default_is_stmt,
+            .line_base = line_base,
+            .line_range = line_range,
+            .opcode_base = opcode_base,
+            .standard_opcode_lengths = standard_opcode_lengths,
+            .include_directories = include_directories,
+            .file_names = file_names,
+            .in_header_bytes = counting_reader.bytes_read,
+        };
+    }
+
+    fn deinit(self: *LineNumberProgramHeader, alloc: Allocator) void {
+        alloc.free(self.standard_opcode_lengths);
+        deinitIncludeDirs(alloc, self.include_directories);
+        deinitFileNames(alloc, self.file_names);
+    }
+
+    fn dataLength(self: *const LineNumberProgramHeader) usize {
+        return self.unit_length - self.in_header_bytes;
+    }
+
+    fn readStandardOpcodeLengths(alloc: Allocator, opcode_base: u8, reader: anytype) ![]u64 {
+        var standard_opcode_lengths = std.ArrayList(u64).init(alloc);
+        defer standard_opcode_lengths.deinit();
+
+        for (1..opcode_base - 1) |_| {
+            const val = try std.leb.readULEB128(u64, reader);
+            try standard_opcode_lengths.append(val);
+        }
+        return try standard_opcode_lengths.toOwnedSlice();
+    }
+
+    fn readIncludeDirectories(alloc: Allocator, reader: anytype) ![][]const u8 {
+        var include_directories = std.ArrayList([]const u8).init(alloc);
+        defer {
+            for (include_directories.items) |d| {
+                alloc.free(d);
+            }
+            include_directories.deinit();
+        }
+
+        while (true) {
+            const p = try reader.readUntilDelimiterAlloc(alloc, 0, 1_000_000);
+            if (p.len == 0) {
+                break;
+            }
+            try include_directories.append(p);
+        }
+        return try include_directories.toOwnedSlice();
+    }
+
+    fn deinitIncludeDirs(alloc: Allocator, include_directories: []const []const u8) void {
+        for (include_directories) |d| {
+            alloc.free(d);
+        }
+        alloc.free(include_directories);
+    }
+
+    fn readFileNames(alloc: Allocator, reader: anytype) ![]FileName {
+        var file_names = std.ArrayList(FileName).init(alloc);
+        defer {
+            for (file_names.items) |*item| {
+                item.deinit(alloc);
+            }
+            file_names.deinit();
+        }
+        while (true) {
+            const f = try FileName.init(alloc, reader) orelse break;
+            try file_names.append(f);
+        }
+        return try file_names.toOwnedSlice();
+    }
+
+    fn deinitFileNames(alloc: Allocator, file_names: []FileName) void {
+        for (file_names) |*f| {
+            f.deinit(alloc);
+        }
+        alloc.free(file_names);
+    }
+
+    const FileName = struct {
+        name: []const u8,
+        dir_idx: u64,
+        mtime: u64,
+        size: u64,
+
+        fn init(alloc: Allocator, reader: anytype) !?FileName {
+            const p = try reader.readUntilDelimiterAlloc(alloc, 0, 1_000_000);
+            if (p.len == 0) {
+                return null;
+            }
+
+            return .{
+                .name = p,
+                .dir_idx = try std.leb.readULEB128(u64, reader),
+                .mtime = try std.leb.readULEB128(u64, reader),
+                .size = try std.leb.readULEB128(u64, reader),
+            };
+        }
+
+        fn deinit(self: *FileName, alloc: Allocator) void {
+            alloc.free(self.name);
+        }
+    };
+};
+
+const DwarfLns = enum(u8) {
+    copy = 1,
+    advance_pc,
+    advance_line,
+    set_file,
+    set_column,
+    negate_stmt,
+    set_basic_block,
+    const_add_pc,
+    fixed_advance_pc,
+    set_prologue_end,
+    set_epilogue_begin,
+    set_isa,
+};
+
+const DwarfLne = enum(u8) {
+    end_sequence = 1,
+    set_address,
+    define_file,
+    set_descriminator,
+    lo_user,
+    hi_user,
+};
+
+/// Line prgram machine modeled after DWARF 4 specification section 6.2, tested
+/// on a zig executable
+pub fn LineProgramMachine(comptime Reader: type) type {
+    return struct {
+        const Self = @This();
+        header: LineNumberProgramHeader,
+        counting_reader: std.io.CountingReader(Reader),
+        state: Snapshot,
+
+        pub const Snapshot = struct {
+            address: u64 = 0,
+            op_index: u32 = 0,
+            file: u32 = 1,
+            line: i32 = 1,
+            column: u32 = 0,
+            is_stmt: bool,
+            basic_block: bool = false,
+            end_sequence: bool = false,
+            prologue_end: bool = false,
+            epilogue_begin: bool = false,
+            isa: u32 = 0,
+            discriminator: u32 = 0,
+
+            fn init(header: LineNumberProgramHeader) Snapshot {
+                return .{
+                    .is_stmt = header.default_is_stmt > 0,
+                };
+            }
+        };
+
+        pub fn init(alloc: Allocator, reader: Reader) !Self {
+            const header = try LineNumberProgramHeader.init(alloc, reader);
+            return .{
+                .header = header,
+                .counting_reader = std.io.countingReader(reader),
+                .state = Snapshot.init(header),
+            };
+        }
+
+        pub fn deinit(self: *Self, alloc: Allocator) void {
+            self.header.deinit(alloc);
+        }
+
+        pub fn next(self: *Self) !?Snapshot {
+            while (true) {
+                if (self.counting_reader.bytes_read >= self.header.dataLength()) {
+                    return null;
+                }
+
+                switch (try self.step()) {
+                    .output => |o| return o,
+                    .cont => continue,
+                }
+            }
+        }
+
+        const StepAction = union(enum) {
+            output: ?Snapshot,
+            cont,
+        };
+
+        fn step(self: *Self) !StepAction {
+            const reader = self.counting_reader.reader();
+            const op = try reader.readByte();
+
+            if (op >= self.header.opcode_base) {
+                return .{ .output = self.doSpecialOp(op) };
+            } else if (op == 0) {
+                return try self.doExtendedOp();
+            } else {
+                return try self.doStandardOp(op);
+            }
+        }
+
+        fn doSpecialOp(self: *Self, op: u8) Snapshot {
+            std.log.debug("Got special op: {d}", .{op});
+            const adjusted_opcode = self.calcAdjustedOpcode(op);
+            const operation_advance = self.calcOperationAdvance(op);
+            self.advanceOperation(operation_advance);
+
+            self.state.line += self.header.line_base + @as(i32, (adjusted_opcode % self.header.line_range));
+            self.state.basic_block = false;
+            self.state.prologue_end = false;
+            self.state.epilogue_begin = false;
+            self.state.discriminator = 0;
+            return self.state;
+        }
+
+        fn advanceOperation(self: *Self, operation_advance: anytype) void {
+            var instruction_advance: u32 = self.header.minimum_instruction_length;
+            instruction_advance *= (self.state.op_index + operation_advance) / self.header.maximum_operations_per_instruction;
+
+            const new_op_index = (self.state.op_index + operation_advance) % self.header.maximum_operations_per_instruction;
+
+            self.state.address += instruction_advance;
+            self.state.op_index = new_op_index;
+        }
+
+        fn calcAdjustedOpcode(self: *const Self, op: u8) u8 {
+            return op - self.header.opcode_base;
+        }
+
+        fn calcOperationAdvance(self: *const Self, op: u8) u8 {
+            const adjusted = self.calcAdjustedOpcode(op);
+            return adjusted / self.header.line_range;
+        }
+
+        fn doStandardOp(self: *Self, op: u8) !StepAction {
+            const reader = self.counting_reader.reader();
+
+            const standard_op = std.meta.intToEnum(DwarfLns, op) catch {
+                return error.UnknownOp;
+            };
+            std.log.debug("Got standard op: {s}", .{@tagName(standard_op)});
+
+            switch (standard_op) {
+                .copy => {
+                    const ret = self.state;
+                    self.state.discriminator = 0;
+                    self.state.basic_block = false;
+                    self.state.prologue_end = false;
+                    self.state.epilogue_begin = false;
+                    return .{ .output = ret };
+                },
+                .advance_pc => {
+                    const val = try std.leb.readULEB128(u32, reader);
+                    self.advanceOperation(val);
+                },
+                .advance_line => {
+                    self.state.line += try std.leb.readILEB128(@TypeOf(self.state.line), reader);
+                },
+                .set_file => {
+                    self.state.file = try std.leb.readULEB128(@TypeOf(self.state.file), reader);
+                },
+                .set_column => {
+                    self.state.column = try std.leb.readULEB128(@TypeOf(self.state.column), reader);
+                },
+                .negate_stmt => {
+                    self.state.is_stmt = !self.state.is_stmt;
+                },
+                .const_add_pc => {
+                    self.advanceOperation(self.calcOperationAdvance(255));
+                },
+                .set_prologue_end => self.state.prologue_end = true,
+                .set_epilogue_begin => self.state.epilogue_begin = true,
+                else => {
+                    std.log.err("Unhandled op: {s}", .{@tagName(standard_op)});
+                    return error.UnhandledOp;
+                },
+            }
+
+            return .cont;
+        }
+
+        fn doExtendedOp(self: *Self) !StepAction {
+            const reader = self.counting_reader.reader();
+            const extended_op_len = try std.leb.readULEB128(@TypeOf(self.state.file), reader);
+            const extended_op_raw = try reader.readByte();
+            const extended_op = std.meta.intToEnum(DwarfLne, extended_op_raw) catch {
+                return error.UnknownOp;
+            };
+            std.log.debug("Got extended op: {s}", .{@tagName(extended_op)});
+
+            // FIXME: Validate read bytes == extended_op_len
+            switch (extended_op) {
+                .set_address => {
+                    // FIXME: 8 byte assumption
+                    // 1 byte op, 8 bytes ptr
+                    // Assuming 64bit machine, invalid assumption but good enough for me for now
+                    std.debug.assert(extended_op_len == 1 + 8);
+                    var new_address: u64 = undefined;
+                    const read_bytes = try reader.readAll(std.mem.asBytes(&new_address));
+                    if (read_bytes != @sizeOf(@TypeOf(new_address))) {
+                        return error.UnexpectedEof;
+                    }
+                    self.state.address = new_address;
+                    self.state.op_index = 0;
+                    return .cont;
+                },
+                .end_sequence => {
+                    self.state.end_sequence = true;
+                    const ret = self.state;
+                    self.state = Snapshot.init(self.header);
+                    return .{ .output = ret };
+                },
+                else => {
+                    std.log.err("Unhandled extended op: {s}", .{@tagName(extended_op)});
+                    return error.UnhandledOp;
+                },
+            }
+        }
+    };
+}
+
+fn lineProgramMachine(alloc: Allocator, debug_line_reader: anytype) !LineProgramMachine(@TypeOf(debug_line_reader)) {
+    return LineProgramMachine(@TypeOf(debug_line_reader)).init(alloc, debug_line_reader);
 }
