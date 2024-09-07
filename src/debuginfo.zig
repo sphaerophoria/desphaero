@@ -133,6 +133,8 @@ fn tagString(tag: libdwarf.Dwarf_Half) []const u8 {
     };
 }
 
+// FIXME: lots of duplication between different as* fns
+// FIXME: Maybe we should represent this as a union
 const DwarfAttr = struct {
     inner: libdwarf.Dwarf_Attribute,
 
@@ -146,6 +148,7 @@ const DwarfAttr = struct {
         const err = libdwarf.dwarf_formaddr(self.inner, &ret, &err_string);
 
         if (err != libdwarf.DW_DLV_OK) {
+            // FIXME: Why are these commented out
             //defer libdwarf.dwarf_dealloc_error(err_string);
             std.log.err("{s}", .{libdwarf.dwarf_errmsg(err_string)});
             return error.NotAddr;
@@ -610,6 +613,7 @@ const DwarfIt = struct {
     }
 
     pub fn next(self: *DwarfIt) !?Output {
+        // FIXME: Name these segments please
         if (self.stack.items.len == 0) {
             if (try self.it.next()) |item| {
                 try self.stack.append(item);
@@ -649,7 +653,7 @@ const DwarfIt = struct {
     }
 };
 
-pub fn dwarfDbgFromPath(exe: [:0]const u8) !libdwarf.Dwarf_Debug {
+fn dwarfDbgFromPath(exe: [:0]const u8) !libdwarf.Dwarf_Debug {
     var dbg: libdwarf.Dwarf_Debug = undefined;
 
     const ret = libdwarf.dwarf_init_path(exe, null, 0, libdwarf.DW_GROUPNUMBER_ANY, null, null, &dbg, null);
@@ -889,8 +893,9 @@ const LineNumberProgramHeader32 = struct {
 
         }
     };
-
 };
+
+// FIXME: There may be an assumption on dwarf 4 that should be checked somewhere
 pub fn lineProgramExperiment(alloc: Allocator) !void {
     const path = "./zig-out/bin/debugee";
     var dbg = try dwarfDbgFromPath("./zig-out/bin/debugee");
@@ -915,7 +920,6 @@ pub fn lineProgramExperiment(alloc: Allocator) !void {
 
 
     for (header.file_names) |f| {
-
         std.debug.print("{s}\n", .{f.name});
         std.debug.print("{d}\n", .{f.dir_idx});
     }

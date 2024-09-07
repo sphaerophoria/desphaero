@@ -99,6 +99,7 @@ pub const ElfMetadata = struct {
     entry: u64,
     fn_addresses: std.StringHashMap(u64),
     string_table: StringTable,
+    // FIXME: We don't use this
     di: std.dwarf.DwarfInfo,
 
     pub fn deinit(self: *ElfMetadata, alloc: Allocator) void {
