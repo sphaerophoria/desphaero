@@ -1,7 +1,7 @@
 const std = @import("std");
 const debuginfo = @import("debuginfo.zig");
 
-pub const std_options = std.Options {
+pub const std_options = std.Options{
     .log_level = std.log.Level.debug,
 };
 

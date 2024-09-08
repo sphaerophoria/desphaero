@@ -892,7 +892,6 @@ const LineNumberProgramHeader32 = struct {
                 .mtime = try std.leb.readULEB128(u64, reader),
                 .size = try std.leb.readULEB128(u64, reader),
             };
-
         }
     };
 };
@@ -926,8 +925,8 @@ const LineProgramMachine = struct {
     state: struct {
         address: u64 = 0,
         op_index: u32 = 0,
-        file: u32 =  1,
-        line: i32 =  1,
+        file: u32 = 1,
+        line: i32 = 1,
         column: u32 = 0,
         is_stmt: bool,
         basic_block: bool = false,
@@ -959,15 +958,14 @@ const LineProgramMachine = struct {
         // instruction size 2, and we wanted to move 3 bytes over, is that
         // possible with integer division? No. Is that valid dwarf? I don't
         // know
-        var instruction_advance: u32  = self.header.minimum_instruction_length;
+        var instruction_advance: u32 = self.header.minimum_instruction_length;
         instruction_advance *= (self.state.op_index + operation_advance) / self.header.maximum_operations_per_instruction;
 
         const new_op_index = (self.state.op_index + operation_advance) % self.header.maximum_operations_per_instruction;
 
-        std.log.debug("incrementing address by: {d}, op by: {d}\n", .{instruction_advance, new_op_index - self.state.op_index});
+        std.log.debug("incrementing address by: {d}, op by: {d}\n", .{ instruction_advance, new_op_index - self.state.op_index });
         self.state.address += instruction_advance;
         self.state.op_index = new_op_index;
-
     }
 
     fn handleSpecialOp(self: *LineProgramMachine, op: u8) void {
@@ -1022,16 +1020,15 @@ const LineProgramMachine = struct {
                     else => {
                         std.log.err("Unhandled extended op: {s}", .{@tagName(extended_op)});
                         return error.UnhandledOp;
-                    }
+                    },
                 }
-
             } else {
                 const standard_op = std.meta.intToEnum(DwarfLns, op) catch {
                     return error.UnknownOp;
                 };
-                std.log.debug("Got standard op: {s}" ,.{@tagName(standard_op)});
+                std.log.debug("Got standard op: {s}", .{@tagName(standard_op)});
 
-                switch(standard_op) {
+                switch (standard_op) {
                     .copy => {
                         const ret = self.*;
                         self.state.discriminator = 0;
@@ -1062,7 +1059,7 @@ const LineProgramMachine = struct {
                     .const_add_pc => {
                         const adjusted_opcode = 255 - self.header.opcode_base;
                         const operation_advance = adjusted_opcode / self.header.line_range;
-                        std.log.debug("Operation_advance: {d}, opcode_base: {d}, line_range: {d}\n", .{operation_advance, self.header.opcode_base, self.header.line_range});
+                        std.log.debug("Operation_advance: {d}, opcode_base: {d}, line_range: {d}\n", .{ operation_advance, self.header.opcode_base, self.header.line_range });
                         self.advanceOperation(operation_advance);
                     },
                     .set_prologue_end => self.state.prologue_end = true,
@@ -1070,7 +1067,7 @@ const LineProgramMachine = struct {
                     else => {
                         std.log.err("Unhandled op: {s}", .{@tagName(standard_op)});
                         return error.UnhandledOp;
-                    }
+                    },
                 }
             }
         }
