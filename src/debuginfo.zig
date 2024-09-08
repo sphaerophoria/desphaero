@@ -805,6 +805,7 @@ fn upperBound(
     return left;
 }
 
+// FIXME: Detect if we're in 32 or 64 bit mode
 const LineNumberProgramHeader32 = struct {
     unit_length: u32,
     // FIXME: Surely we should do something with this
@@ -816,13 +817,18 @@ const LineNumberProgramHeader32 = struct {
     line_base: i8,
     line_range: u8,
     opcode_base: u8,
+    // FIXME: Should we do something with this?
     standard_opcode_lengths: []u64,
     include_directories: [][]const u8,
     file_names: []FileName,
+    in_header_bytes: usize,
 
-    fn init(alloc: Allocator, reader: anytype) !LineNumberProgramHeader32 {
-        const unit_length = try reader.readInt(u32, .little);
+    fn init(alloc: Allocator, in_reader: anytype) !LineNumberProgramHeader32 {
+        const unit_length = try in_reader.readInt(u32, .little);
         std.debug.assert(unit_length < 0xfffffff0);
+
+        var counting_reader = std.io.countingReader(in_reader);
+        const reader = counting_reader.reader();
 
         const version = try reader.readInt(u16, .little);
         // suspect
@@ -871,7 +877,12 @@ const LineNumberProgramHeader32 = struct {
             .standard_opcode_lengths = try standard_opcode_lengths.toOwnedSlice(),
             .include_directories = try include_directories.toOwnedSlice(),
             .file_names = try file_names.toOwnedSlice(),
+            .in_header_bytes = counting_reader.bytes_read,
         };
+    }
+
+    fn dataLength(self: *const LineNumberProgramHeader32) usize {
+        return self.unit_length - self.in_header_bytes;
     }
 
     const FileName = struct {
@@ -920,159 +931,200 @@ const DwarfLne = enum(u8) {
     hi_user,
 };
 
-const LineProgramMachine = struct {
-    header: *const LineNumberProgramHeader32,
-    state: struct {
-        address: u64 = 0,
-        op_index: u32 = 0,
-        file: u32 = 1,
-        line: i32 = 1,
-        column: u32 = 0,
-        is_stmt: bool,
-        basic_block: bool = false,
-        end_sequence: bool = false,
-        prologue_end: bool = false,
-        epilogue_begin: bool = false,
-        isa: u32 = 0,
-        discriminator: u32 = 0,
-    },
+pub fn LineProgramMachine(comptime Reader: type) type {
+    return struct {
+        const Self = @This();
+        header: *const LineNumberProgramHeader32,
+        counting_reader: std.io.CountingReader(Reader),
+        state: Snapshot,
 
-    fn init(header: *const LineNumberProgramHeader32) LineProgramMachine {
-        return .{
-            .header = header,
-            .state = .{
-                .is_stmt = header.default_is_stmt > 0,
-            },
+        const Snapshot = struct {
+            address: u64 = 0,
+            op_index: u32 = 0,
+            file: u32 = 1,
+            line: i32 = 1,
+            column: u32 = 0,
+            is_stmt: bool,
+            basic_block: bool = false,
+            end_sequence: bool = false,
+            prologue_end: bool = false,
+            epilogue_begin: bool = false,
+            isa: u32 = 0,
+            discriminator: u32 = 0,
+
+            fn init(header: *const LineNumberProgramHeader32) Snapshot {
+                return .{
+                    .is_stmt = header.default_is_stmt > 0,
+                };
+            }
         };
-    }
 
-    fn reset(self: *LineProgramMachine) void {
-        // FIXME: Duplicated with init???
-        self.state = .{
-            .is_stmt = self.header.default_is_stmt > 0,
+        fn init(header: *const LineNumberProgramHeader32, reader: Reader) Self {
+            return .{
+                .header = header,
+                .counting_reader = std.io.countingReader(reader),
+                .state = Snapshot.init(header),
+            };
+        }
+
+        fn reset(self: *Self) void {
+            self.state = Snapshot.init(self.header);
+        }
+
+        fn advanceOperation(self: *Self, operation_advance: anytype) void {
+            var instruction_advance: u32 = self.header.minimum_instruction_length;
+            instruction_advance *= (self.state.op_index + operation_advance) / self.header.maximum_operations_per_instruction;
+
+            const new_op_index = (self.state.op_index + operation_advance) % self.header.maximum_operations_per_instruction;
+
+            self.state.address += instruction_advance;
+            self.state.op_index = new_op_index;
+        }
+
+        fn calcAdjustedOpcode(self: *const Self, op: u8) u8 {
+            return op - self.header.opcode_base;
+        }
+
+        fn calcOperationAdvance(self: *const Self, op: u8) u8 {
+            const adjusted = self.calcAdjustedOpcode(op);
+            return adjusted / self.header.line_range;
+        }
+
+        fn doSpecialOp(self: *Self, op: u8) Snapshot {
+            std.log.debug("Got special op: {d}", .{op});
+            const adjusted_opcode = self.calcAdjustedOpcode(op);
+            const operation_advance = self.calcOperationAdvance(op);
+            self.advanceOperation(operation_advance);
+
+            self.state.line += self.header.line_base + @as(i32, (adjusted_opcode % self.header.line_range));
+            self.state.basic_block = false;
+            self.state.prologue_end = false;
+            self.state.epilogue_begin = false;
+            self.state.discriminator = 0;
+            return self.state;
+        }
+
+        const StepAction = union(enum) {
+            output: ?Snapshot,
+            cont,
         };
-    }
 
-    fn advanceOperation(self: *LineProgramMachine, operation_advance: anytype) void {
-        // FIXME: Is this supposed to be floating point math? If we had minimum
-        // instruction size 2, and we wanted to move 3 bytes over, is that
-        // possible with integer division? No. Is that valid dwarf? I don't
-        // know
-        var instruction_advance: u32 = self.header.minimum_instruction_length;
-        instruction_advance *= (self.state.op_index + operation_advance) / self.header.maximum_operations_per_instruction;
+        fn doExtendedOp(self: *Self) !StepAction {
+            const reader = self.counting_reader.reader();
+            const extended_op_len = try std.leb.readULEB128(@TypeOf(self.state.file), reader);
+            const extended_op_raw = try reader.readByte();
+            const extended_op = std.meta.intToEnum(DwarfLne, extended_op_raw) catch {
+                return error.UnknownOp;
+            };
+            std.log.debug("Got extended op: {s}", .{@tagName(extended_op)});
 
-        const new_op_index = (self.state.op_index + operation_advance) % self.header.maximum_operations_per_instruction;
+            // FIXME: Validate read bytes == extended_op_len
+            switch (extended_op) {
+                .set_address => {
+                    // FIXME: 8 byte assumption
+                    // 1 byte op, 8 bytes ptr
+                    // Assuming 64bit machine, invalid assumption but good enough for me for now
+                    std.debug.assert(extended_op_len == 1 + 8);
+                    var new_address: u64 = undefined;
+                    const read_bytes = try reader.readAll(std.mem.asBytes(&new_address));
+                    if (read_bytes != @sizeOf(@TypeOf(new_address))) {
+                        return error.UnexpectedEof;
+                    }
+                    self.state.address = new_address;
+                    self.state.op_index = 0;
+                    return .cont;
+                },
+                .end_sequence => {
+                    self.state.end_sequence = true;
+                    const ret = self.state;
+                    self.reset();
+                    return .{ .output = ret };
+                },
+                else => {
+                    std.log.err("Unhandled extended op: {s}", .{@tagName(extended_op)});
+                    return error.UnhandledOp;
+                },
+            }
+        }
 
-        std.log.debug("incrementing address by: {d}, op by: {d}\n", .{ instruction_advance, new_op_index - self.state.op_index });
-        self.state.address += instruction_advance;
-        self.state.op_index = new_op_index;
-    }
+        fn doStandardOp(self: *Self, op: u8) !StepAction {
+            const reader = self.counting_reader.reader();
 
-    fn handleSpecialOp(self: *LineProgramMachine, op: u8) void {
-        const adjusted_opcode = op - self.header.opcode_base;
-        const operation_advance = adjusted_opcode / self.header.line_range;
-        self.advanceOperation(operation_advance);
+            const standard_op = std.meta.intToEnum(DwarfLns, op) catch {
+                return error.UnknownOp;
+            };
+            std.log.debug("Got standard op: {s}", .{@tagName(standard_op)});
 
-        const line_increment = self.header.line_base + @as(i32, (adjusted_opcode % self.header.line_range));
-        self.state.line += line_increment;
-        self.state.basic_block = false;
-        self.state.prologue_end = false;
-        self.state.epilogue_begin = false;
-        self.state.discriminator = 0;
-    }
+            switch (standard_op) {
+                .copy => {
+                    const ret = self.state;
+                    self.state.discriminator = 0;
+                    self.state.basic_block = false;
+                    self.state.prologue_end = false;
+                    self.state.epilogue_begin = false;
+                    return .{ .output = ret };
+                },
+                .advance_pc => {
+                    const val = try std.leb.readULEB128(u32, reader);
+                    self.advanceOperation(val);
+                },
+                .advance_line => {
+                    self.state.line += try std.leb.readILEB128(@TypeOf(self.state.line), reader);
+                },
+                .set_file => {
+                    self.state.file = try std.leb.readULEB128(@TypeOf(self.state.file), reader);
+                },
+                .set_column => {
+                    self.state.column = try std.leb.readULEB128(@TypeOf(self.state.column), reader);
+                },
+                .negate_stmt => {
+                    self.state.is_stmt = !self.state.is_stmt;
+                },
+                .const_add_pc => {
+                    self.advanceOperation(self.calcOperationAdvance(255));
+                },
+                .set_prologue_end => self.state.prologue_end = true,
+                .set_epilogue_begin => self.state.epilogue_begin = true,
+                else => {
+                    std.log.err("Unhandled op: {s}", .{@tagName(standard_op)});
+                    return error.UnhandledOp;
+                },
+            }
 
-    fn next(self: *LineProgramMachine, reader: anytype) !?LineProgramMachine {
-        while (true) {
+            return .cont;
+        }
+
+        fn step(self: *Self) !StepAction {
+            const reader = self.counting_reader.reader();
             const op = try reader.readByte();
 
             if (op >= self.header.opcode_base) {
-                std.log.debug("Got special op: {d}", .{op});
-                self.handleSpecialOp(op);
-                return self.*;
+                return .{ .output = self.doSpecialOp(op) };
             } else if (op == 0) {
-                const extended_op_len = try std.leb.readULEB128(@TypeOf(self.state.file), reader);
-                const extended_op_raw = try reader.readByte();
-                const extended_op = std.meta.intToEnum(DwarfLne, extended_op_raw) catch {
-                    return error.UnknownOp;
-                };
-                std.log.debug("Got extended op: {s}", .{@tagName(extended_op)});
-
-                // FIXME: Validate read bytes == extended_op_len
-                switch (extended_op) {
-                    .set_address => {
-                        // 1 byte op, 8 bytes ptr
-                        // Assuming 64bit machine, invalid assumption but good enough for me for now
-                        std.debug.assert(extended_op_len == 1 + 8);
-                        var new_address: u64 = undefined;
-                        const read_bytes = try reader.readAll(std.mem.asBytes(&new_address));
-                        if (read_bytes != @sizeOf(@TypeOf(new_address))) {
-                            return error.UnexpectedEof;
-                        }
-                        self.state.address = new_address;
-                        self.state.op_index = 0;
-                    },
-                    .end_sequence => {
-                        self.state.end_sequence = true;
-                        const ret = self.*;
-                        self.reset();
-                        return ret;
-                    },
-                    else => {
-                        std.log.err("Unhandled extended op: {s}", .{@tagName(extended_op)});
-                        return error.UnhandledOp;
-                    },
-                }
+                return try self.doExtendedOp();
             } else {
-                const standard_op = std.meta.intToEnum(DwarfLns, op) catch {
-                    return error.UnknownOp;
-                };
-                std.log.debug("Got standard op: {s}", .{@tagName(standard_op)});
+                return try self.doStandardOp(op);
+            }
+        }
 
-                switch (standard_op) {
-                    .copy => {
-                        const ret = self.*;
-                        self.state.discriminator = 0;
-                        self.state.basic_block = false;
-                        self.state.prologue_end = false;
-                        self.state.epilogue_begin = false;
-                        return ret;
-                    },
-                    .advance_pc => {
-                        const val = try std.leb.readULEB128(u32, reader);
-                        self.advanceOperation(val);
-                    },
-                    .advance_line => {
-                        const advance = try std.leb.readILEB128(@TypeOf(self.state.line), reader);
-                        self.state.line += advance;
-                    },
-                    .set_file => {
-                        const file = try std.leb.readULEB128(@TypeOf(self.state.file), reader);
-                        self.state.file = file;
-                    },
-                    .set_column => {
-                        const column = try std.leb.readULEB128(@TypeOf(self.state.column), reader);
-                        self.state.column = column;
-                    },
-                    .negate_stmt => {
-                        self.state.is_stmt = !self.state.is_stmt;
-                    },
-                    .const_add_pc => {
-                        const adjusted_opcode = 255 - self.header.opcode_base;
-                        const operation_advance = adjusted_opcode / self.header.line_range;
-                        std.log.debug("Operation_advance: {d}, opcode_base: {d}, line_range: {d}\n", .{ operation_advance, self.header.opcode_base, self.header.line_range });
-                        self.advanceOperation(operation_advance);
-                    },
-                    .set_prologue_end => self.state.prologue_end = true,
-                    .set_epilogue_begin => self.state.epilogue_begin = true,
-                    else => {
-                        std.log.err("Unhandled op: {s}", .{@tagName(standard_op)});
-                        return error.UnhandledOp;
-                    },
+        fn next(self: *Self) !?Snapshot {
+            while (true) {
+                if (self.counting_reader.bytes_read >= self.header.dataLength()) {
+                    return null;
+                }
+
+                switch (try self.step()) {
+                    .output => |o| return o,
+                    .cont => continue,
                 }
             }
         }
-    }
-};
+    };
+}
+
+fn lineProgramMachine(header: *const LineNumberProgramHeader32, reader: anytype) LineProgramMachine(@TypeOf(reader)) {
+    return LineProgramMachine(@TypeOf(reader)).init(header, reader);
+}
 
 // FIXME: There may be an assumption on dwarf 4 that should be checked somewhere
 pub fn lineProgramExperiment(alloc: Allocator) !void {
@@ -1097,21 +1149,13 @@ pub fn lineProgramExperiment(alloc: Allocator) !void {
 
     const header = try LineNumberProgramHeader32.init(alloc, reader);
 
-    var lpm = LineProgramMachine.init(&header);
-    // FIXME: + 4 is not true for all elfs
-    const end_pos = header.unit_length + 4;
-    // FIXME: need exit condition of lpm
-    while (try lpm.next(reader)) |item| {
-        if (fbr.pos >= end_pos) {
-            break;
-        }
-        std.debug.print("({d}/{d}) 0x{x} -> {s}:{d}:{d}\n", .{
-            fbr.pos,
-            end_pos,
-            item.state.address,
-            header.file_names[item.state.file - 1].name,
-            item.state.line,
-            item.state.column,
+    var lpm = lineProgramMachine(&header, reader);
+    while (try lpm.next()) |item| {
+        std.debug.print("0x{x} -> {s}:{d}:{d}\n", .{
+            item.address,
+            header.file_names[item.file - 1].name,
+            item.line,
+            item.column,
         });
     }
 }
