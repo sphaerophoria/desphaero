@@ -1,6 +1,10 @@
 const std = @import("std");
 const debuginfo = @import("debuginfo.zig");
 
+pub const std_options = std.Options {
+    .log_level = std.log.Level.debug,
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     //defer _ = gpa.deinit();
