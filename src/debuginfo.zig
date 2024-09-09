@@ -990,6 +990,8 @@ const DwarfLne = enum(u8) {
     hi_user,
 };
 
+/// Line prgram machine modeled after DWARF 4 specification section 6.2, tested
+/// on a zig executable
 pub fn LineProgramMachine(comptime Reader: type) type {
     return struct {
         const Self = @This();
@@ -1184,6 +1186,13 @@ pub fn LineProgramMachine(comptime Reader: type) type {
 
 fn lineProgramMachine(alloc: Allocator, debug_line_reader: anytype) !LineProgramMachine(@TypeOf(debug_line_reader)) {
     return LineProgramMachine(@TypeOf(debug_line_reader)).init(alloc, debug_line_reader);
+}
+
+// FIXME: Implement once we have some idea of what we want
+test "line program machine sanity" {
+    // Looking for pairs of instruction pointer to line number?
+    // We could just hard-code some tests, compile a binary one time and look
+    // for patterns in that binary we know to be true
 }
 
 // FIXME: There may be an assumption on dwarf 4 that should be checked somewhere
