@@ -806,7 +806,9 @@ fn upperBound(
 }
 
 // FIXME: Detect if we're in 32 or 64 bit mode
-const LineNumberProgramHeader32 = struct {
+// FIXME: We probably don't actually need this, we can prune fields that we
+// don't care about
+const LineNumberProgramHeader = struct {
     unit_length: u32,
     // FIXME: Surely we should do something with this
     version: u16,
@@ -823,15 +825,18 @@ const LineNumberProgramHeader32 = struct {
     file_names: []FileName,
     in_header_bytes: usize,
 
-    fn init(alloc: Allocator, in_reader: anytype) !LineNumberProgramHeader32 {
+    fn init(alloc: Allocator, in_reader: anytype) !LineNumberProgramHeader {
         const unit_length = try in_reader.readInt(u32, .little);
+
+        // Only 32 bit header parsing is implemented
+        // Only 32 bit header parsing with small unit lengths implemented
         std.debug.assert(unit_length < 0xfffffff0);
 
         var counting_reader = std.io.countingReader(in_reader);
         const reader = counting_reader.reader();
 
         const version = try reader.readInt(u16, .little);
-        // suspect
+        // FIXME: Validate read length matches header length
         const header_length = try reader.readInt(u32, .little);
         const minimum_instruction_length = try reader.readInt(u8, .little);
         const maximum_operations_per_instruction = try reader.readInt(u8, .little);
@@ -839,30 +844,15 @@ const LineNumberProgramHeader32 = struct {
         const line_base = try reader.readInt(i8, .little);
         const line_range = try reader.readInt(u8, .little);
         const opcode_base = try reader.readInt(u8, .little);
-        var standard_opcode_lengths = std.ArrayList(u64).init(alloc);
-        defer standard_opcode_lengths.deinit();
 
-        for (1..opcode_base - 1) |_| {
-            const val = try std.leb.readULEB128(u64, reader);
-            try standard_opcode_lengths.append(val);
-        }
+        const standard_opcode_lengths = try readStandardOpcodeLengths(alloc, opcode_base, reader);
+        errdefer alloc.free(standard_opcode_lengths);
 
-        var include_directories = std.ArrayList([]const u8).init(alloc);
-        defer include_directories.deinit();
-        while (true) {
-            const p = try reader.readUntilDelimiterAlloc(alloc, 0, 1_000_000);
-            if (p.len == 0) {
-                break;
-            }
-            try include_directories.append(p);
-        }
+        const include_directories = try readIncludeDirectories(alloc, reader);
+        errdefer deinitIncludeDirs(alloc, include_directories);
 
-        var file_names = std.ArrayList(FileName).init(alloc);
-        defer file_names.deinit();
-        while (true) {
-            const f = try FileName.init(alloc, reader) orelse break;
-            try file_names.append(f);
-        }
+        const file_names = try readFileNames(alloc, reader);
+        errdefer deinitFileNames(file_names);
 
         return .{
             .unit_length = unit_length,
@@ -874,15 +864,80 @@ const LineNumberProgramHeader32 = struct {
             .line_base = line_base,
             .line_range = line_range,
             .opcode_base = opcode_base,
-            .standard_opcode_lengths = try standard_opcode_lengths.toOwnedSlice(),
-            .include_directories = try include_directories.toOwnedSlice(),
-            .file_names = try file_names.toOwnedSlice(),
+            .standard_opcode_lengths = standard_opcode_lengths,
+            .include_directories = include_directories,
+            .file_names = file_names,
             .in_header_bytes = counting_reader.bytes_read,
         };
     }
 
-    fn dataLength(self: *const LineNumberProgramHeader32) usize {
+    fn deinit(self: *LineNumberProgramHeader, alloc: Allocator) void {
+        alloc.free(self.standard_opcode_lengths);
+        deinitIncludeDirs(alloc, self.include_directories);
+        deinitFileNames(alloc, self.file_names);
+    }
+
+    fn dataLength(self: *const LineNumberProgramHeader) usize {
         return self.unit_length - self.in_header_bytes;
+    }
+
+    fn readStandardOpcodeLengths(alloc: Allocator, opcode_base: u8, reader: anytype) ![]u64 {
+        var standard_opcode_lengths = std.ArrayList(u64).init(alloc);
+        defer standard_opcode_lengths.deinit();
+
+        for (1..opcode_base - 1) |_| {
+            const val = try std.leb.readULEB128(u64, reader);
+            try standard_opcode_lengths.append(val);
+        }
+        return try standard_opcode_lengths.toOwnedSlice();
+    }
+
+    fn readIncludeDirectories(alloc: Allocator, reader: anytype) ![][]const u8 {
+        var include_directories = std.ArrayList([]const u8).init(alloc);
+        defer {
+            for (include_directories.items) |d| {
+                alloc.free(d);
+            }
+            include_directories.deinit();
+        }
+
+        while (true) {
+            const p = try reader.readUntilDelimiterAlloc(alloc, 0, 1_000_000);
+            if (p.len == 0) {
+                break;
+            }
+            try include_directories.append(p);
+        }
+        return try include_directories.toOwnedSlice();
+    }
+
+    fn deinitIncludeDirs(alloc: Allocator, include_directories: []const []const u8) void {
+        for (include_directories) |d| {
+            alloc.free(d);
+        }
+        alloc.free(include_directories);
+    }
+
+    fn readFileNames(alloc: Allocator, reader: anytype) ![]FileName {
+        var file_names = std.ArrayList(FileName).init(alloc);
+        defer {
+            for (file_names.items) |*item| {
+                item.deinit(alloc);
+            }
+            file_names.deinit();
+        }
+        while (true) {
+            const f = try FileName.init(alloc, reader) orelse break;
+            try file_names.append(f);
+        }
+        return try file_names.toOwnedSlice();
+    }
+
+    fn deinitFileNames(alloc: Allocator, file_names: []FileName) void {
+        for (file_names) |*f| {
+            f.deinit(alloc);
+        }
+        alloc.free(file_names);
     }
 
     const FileName = struct {
@@ -903,6 +958,10 @@ const LineNumberProgramHeader32 = struct {
                 .mtime = try std.leb.readULEB128(u64, reader),
                 .size = try std.leb.readULEB128(u64, reader),
             };
+        }
+
+        fn deinit(self: *FileName, alloc: Allocator) void {
+            alloc.free(self.name);
         }
     };
 };
@@ -934,11 +993,11 @@ const DwarfLne = enum(u8) {
 pub fn LineProgramMachine(comptime Reader: type) type {
     return struct {
         const Self = @This();
-        header: *const LineNumberProgramHeader32,
+        header: LineNumberProgramHeader,
         counting_reader: std.io.CountingReader(Reader),
         state: Snapshot,
 
-        const Snapshot = struct {
+        pub const Snapshot = struct {
             address: u64 = 0,
             op_index: u32 = 0,
             file: u32 = 1,
@@ -952,14 +1011,15 @@ pub fn LineProgramMachine(comptime Reader: type) type {
             isa: u32 = 0,
             discriminator: u32 = 0,
 
-            fn init(header: *const LineNumberProgramHeader32) Snapshot {
+            fn init(header: LineNumberProgramHeader) Snapshot {
                 return .{
                     .is_stmt = header.default_is_stmt > 0,
                 };
             }
         };
 
-        fn init(header: *const LineNumberProgramHeader32, reader: Reader) Self {
+        pub fn init(alloc: Allocator, reader: Reader) !Self {
+            const header = try LineNumberProgramHeader.init(alloc, reader);
             return .{
                 .header = header,
                 .counting_reader = std.io.countingReader(reader),
@@ -967,8 +1027,53 @@ pub fn LineProgramMachine(comptime Reader: type) type {
             };
         }
 
-        fn reset(self: *Self) void {
-            self.state = Snapshot.init(self.header);
+        pub fn deinit(self: *Self, alloc: Allocator) void {
+            self.header.deinit(alloc);
+        }
+
+        pub fn next(self: *Self) !?Snapshot {
+            while (true) {
+                if (self.counting_reader.bytes_read >= self.header.dataLength()) {
+                    return null;
+                }
+
+                switch (try self.step()) {
+                    .output => |o| return o,
+                    .cont => continue,
+                }
+            }
+        }
+
+        const StepAction = union(enum) {
+            output: ?Snapshot,
+            cont,
+        };
+
+        fn step(self: *Self) !StepAction {
+            const reader = self.counting_reader.reader();
+            const op = try reader.readByte();
+
+            if (op >= self.header.opcode_base) {
+                return .{ .output = self.doSpecialOp(op) };
+            } else if (op == 0) {
+                return try self.doExtendedOp();
+            } else {
+                return try self.doStandardOp(op);
+            }
+        }
+
+        fn doSpecialOp(self: *Self, op: u8) Snapshot {
+            std.log.debug("Got special op: {d}", .{op});
+            const adjusted_opcode = self.calcAdjustedOpcode(op);
+            const operation_advance = self.calcOperationAdvance(op);
+            self.advanceOperation(operation_advance);
+
+            self.state.line += self.header.line_base + @as(i32, (adjusted_opcode % self.header.line_range));
+            self.state.basic_block = false;
+            self.state.prologue_end = false;
+            self.state.epilogue_begin = false;
+            self.state.discriminator = 0;
+            return self.state;
         }
 
         fn advanceOperation(self: *Self, operation_advance: anytype) void {
@@ -988,63 +1093,6 @@ pub fn LineProgramMachine(comptime Reader: type) type {
         fn calcOperationAdvance(self: *const Self, op: u8) u8 {
             const adjusted = self.calcAdjustedOpcode(op);
             return adjusted / self.header.line_range;
-        }
-
-        fn doSpecialOp(self: *Self, op: u8) Snapshot {
-            std.log.debug("Got special op: {d}", .{op});
-            const adjusted_opcode = self.calcAdjustedOpcode(op);
-            const operation_advance = self.calcOperationAdvance(op);
-            self.advanceOperation(operation_advance);
-
-            self.state.line += self.header.line_base + @as(i32, (adjusted_opcode % self.header.line_range));
-            self.state.basic_block = false;
-            self.state.prologue_end = false;
-            self.state.epilogue_begin = false;
-            self.state.discriminator = 0;
-            return self.state;
-        }
-
-        const StepAction = union(enum) {
-            output: ?Snapshot,
-            cont,
-        };
-
-        fn doExtendedOp(self: *Self) !StepAction {
-            const reader = self.counting_reader.reader();
-            const extended_op_len = try std.leb.readULEB128(@TypeOf(self.state.file), reader);
-            const extended_op_raw = try reader.readByte();
-            const extended_op = std.meta.intToEnum(DwarfLne, extended_op_raw) catch {
-                return error.UnknownOp;
-            };
-            std.log.debug("Got extended op: {s}", .{@tagName(extended_op)});
-
-            // FIXME: Validate read bytes == extended_op_len
-            switch (extended_op) {
-                .set_address => {
-                    // FIXME: 8 byte assumption
-                    // 1 byte op, 8 bytes ptr
-                    // Assuming 64bit machine, invalid assumption but good enough for me for now
-                    std.debug.assert(extended_op_len == 1 + 8);
-                    var new_address: u64 = undefined;
-                    const read_bytes = try reader.readAll(std.mem.asBytes(&new_address));
-                    if (read_bytes != @sizeOf(@TypeOf(new_address))) {
-                        return error.UnexpectedEof;
-                    }
-                    self.state.address = new_address;
-                    self.state.op_index = 0;
-                    return .cont;
-                },
-                .end_sequence => {
-                    self.state.end_sequence = true;
-                    const ret = self.state;
-                    self.reset();
-                    return .{ .output = ret };
-                },
-                else => {
-                    std.log.err("Unhandled extended op: {s}", .{@tagName(extended_op)});
-                    return error.UnhandledOp;
-                },
-            }
         }
 
         fn doStandardOp(self: *Self, op: u8) !StepAction {
@@ -1094,36 +1142,48 @@ pub fn LineProgramMachine(comptime Reader: type) type {
             return .cont;
         }
 
-        fn step(self: *Self) !StepAction {
+        fn doExtendedOp(self: *Self) !StepAction {
             const reader = self.counting_reader.reader();
-            const op = try reader.readByte();
+            const extended_op_len = try std.leb.readULEB128(@TypeOf(self.state.file), reader);
+            const extended_op_raw = try reader.readByte();
+            const extended_op = std.meta.intToEnum(DwarfLne, extended_op_raw) catch {
+                return error.UnknownOp;
+            };
+            std.log.debug("Got extended op: {s}", .{@tagName(extended_op)});
 
-            if (op >= self.header.opcode_base) {
-                return .{ .output = self.doSpecialOp(op) };
-            } else if (op == 0) {
-                return try self.doExtendedOp();
-            } else {
-                return try self.doStandardOp(op);
-            }
-        }
-
-        fn next(self: *Self) !?Snapshot {
-            while (true) {
-                if (self.counting_reader.bytes_read >= self.header.dataLength()) {
-                    return null;
-                }
-
-                switch (try self.step()) {
-                    .output => |o| return o,
-                    .cont => continue,
-                }
+            // FIXME: Validate read bytes == extended_op_len
+            switch (extended_op) {
+                .set_address => {
+                    // FIXME: 8 byte assumption
+                    // 1 byte op, 8 bytes ptr
+                    // Assuming 64bit machine, invalid assumption but good enough for me for now
+                    std.debug.assert(extended_op_len == 1 + 8);
+                    var new_address: u64 = undefined;
+                    const read_bytes = try reader.readAll(std.mem.asBytes(&new_address));
+                    if (read_bytes != @sizeOf(@TypeOf(new_address))) {
+                        return error.UnexpectedEof;
+                    }
+                    self.state.address = new_address;
+                    self.state.op_index = 0;
+                    return .cont;
+                },
+                .end_sequence => {
+                    self.state.end_sequence = true;
+                    const ret = self.state;
+                    self.state = Snapshot.init(self.header);
+                    return .{ .output = ret };
+                },
+                else => {
+                    std.log.err("Unhandled extended op: {s}", .{@tagName(extended_op)});
+                    return error.UnhandledOp;
+                },
             }
         }
     };
 }
 
-fn lineProgramMachine(header: *const LineNumberProgramHeader32, reader: anytype) LineProgramMachine(@TypeOf(reader)) {
-    return LineProgramMachine(@TypeOf(reader)).init(header, reader);
+fn lineProgramMachine(alloc: Allocator, debug_line_reader: anytype) !LineProgramMachine(@TypeOf(debug_line_reader)) {
+    return LineProgramMachine(@TypeOf(debug_line_reader)).init(alloc, debug_line_reader);
 }
 
 // FIXME: There may be an assumption on dwarf 4 that should be checked somewhere
@@ -1147,13 +1207,12 @@ pub fn lineProgramExperiment(alloc: Allocator) !void {
     var fbr = std.io.fixedBufferStream(prog);
     const reader = fbr.reader();
 
-    const header = try LineNumberProgramHeader32.init(alloc, reader);
-
-    var lpm = lineProgramMachine(&header, reader);
+    var lpm = try lineProgramMachine(alloc, reader);
+    defer lpm.deinit(alloc);
     while (try lpm.next()) |item| {
         std.debug.print("0x{x} -> {s}:{d}:{d}\n", .{
             item.address,
-            header.file_names[item.file - 1].name,
+            lpm.header.file_names[item.file - 1].name,
             item.line,
             item.column,
         });
