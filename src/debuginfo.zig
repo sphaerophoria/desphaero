@@ -748,6 +748,11 @@ pub const SourceLocation = struct {
     pub fn deinit(self: *SourceLocation, alloc: Allocator) void {
         alloc.free(self.path);
     }
+
+    pub fn eql(self: SourceLocation, other: SourceLocation) bool {
+        comptime std.debug.assert(std.meta.fields(SourceLocation).len == 2);
+        return std.mem.eql(u8, self.path, other.path) and self.line == other.line;
+    }
 };
 
 pub const DwarfInfo = struct {
