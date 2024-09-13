@@ -20,7 +20,9 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
-    desphaero.linkSystemLibrary("dwarf");
+    desphaero.linkSystemLibrary("libdwarf");
+    desphaero.linkSystemLibrary("z");
+    desphaero.linkSystemLibrary("zstd");
     desphaero.linkLibC();
 
 
@@ -33,7 +35,9 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
-    dwarf_test.linkSystemLibrary("dwarf");
+    dwarf_test.linkSystemLibrary("libdwarf");
+    dwarf_test.linkSystemLibrary("z");
+    dwarf_test.linkSystemLibrary("zstd");
     dwarf_test.linkLibC();
 
     const check_dwarf_test = try b.allocator.create(std.Build.Step.Compile);

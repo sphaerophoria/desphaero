@@ -3,8 +3,8 @@ const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 const elf = @import("elf.zig");
 const libdwarf = @cImport({
-    @cInclude("libdwarf-0/dwarf.h");
-    @cInclude("libdwarf-0/libdwarf.h");
+    @cInclude("dwarf.h");
+    @cInclude("libdwarf.h");
 });
 
 fn tagString(tag: libdwarf.Dwarf_Half) []const u8 {

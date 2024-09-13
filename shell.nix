@@ -13,7 +13,10 @@ pkgs.mkShell {
     gdb
     valgrind
     python3
+    pkg-config
     libdwarf
+    libz
+    zstd
   ];
 }
 
