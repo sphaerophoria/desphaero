@@ -592,6 +592,7 @@ const DwarfIt = struct {
     }
 
     pub fn next(self: *DwarfIt) !?Output {
+        // FIXME: Name these segments please
         if (self.stack.items.len == 0) {
             if (try self.it.next()) |item| {
                 try self.stack.append(item);
