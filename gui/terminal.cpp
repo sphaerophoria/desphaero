@@ -24,8 +24,8 @@ extern "C" int runGui(TerminalEmulatorState* state) {
 
   // Third, register the singleton type provider with QML by calling this
   // function in an initialization function.
-  qmlRegisterSingletonInstance("sphaerophoria.desphaero", 1, 0, "TerminalBackend",
-                               state);
+  qmlRegisterSingletonInstance("sphaerophoria.desphaero", 1, 0,
+                               "TerminalBackend", state);
 
   engine.load(QUrl(QStringLiteral("./gui/qml/terminal_main.qml")));
   return app.exec();
