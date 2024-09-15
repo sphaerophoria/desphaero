@@ -1,0 +1,17 @@
+.{
+    .name = "desphaero",
+    .version = "0.0.1",
+    .minimum_zig_version = "0.13.0",
+    .dependencies = .{
+        .qt = .{
+            .url = "https://github.com/sphaerophoria/qtzig/archive/82606faf22b6ed3ccc9677dee9c7845cca2210ba.tar.gz",
+	    .hash = "1220ee80a33311dcfadcf834dbb4e5619795d365a1c04a2c09c98ec6063a688c0bde",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "build/cc.sh",
+        "build/cxx.py",
+    },
+}

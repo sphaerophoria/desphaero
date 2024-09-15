@@ -1,10 +1,14 @@
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const elf = @import("elf.zig");
-const c = @cImport({
-    @cInclude("sys/user.h");
-});
 const debuginfo = @import("debuginfo.zig");
+const Debugger = @import("Debugger.zig");
+const gui = @import("gui.zig");
+
+pub const std_options = std.Options{
+    .log_level = .warn,
+};
 
 fn printPidMaps(alloc: Allocator, pid: std.os.linux.pid_t) void {
     var path_buf: [1024]u8 = undefined;
@@ -17,238 +21,6 @@ fn printPidMaps(alloc: Allocator, pid: std.os.linux.pid_t) void {
 
     std.debug.print("Current maps:\n{s}\n", .{maps_data});
 }
-
-fn addu64i64(a: u64, b: i64) u64 {
-    const b_u: u64 = @bitCast(b);
-    return a +% b_u;
-}
-
-const DebugStatus = union(enum) {
-    stopped: struct {
-        siginfo: std.os.linux.siginfo_t,
-    },
-    finished,
-};
-
-const Debugger = struct {
-    const int3 = 0xcc;
-
-    alloc: Allocator,
-    exe: [:0]const u8,
-    pid: std.posix.pid_t = 0,
-    dwarf_info: debuginfo.DwarfInfo,
-    elf_metadata: elf.ElfMetadata,
-
-    breakpoints: std.AutoHashMapUnmanaged(u64, u8) = .{},
-    pending_breakpoints: std.AutoHashMapUnmanaged(u64, void) = .{},
-
-    regs: c.user_regs_struct = undefined,
-    last_signum: i32 = 0,
-
-    pub fn init(alloc: Allocator, exe: [:0]const u8) !Debugger {
-        var diagnostics = debuginfo.DwarfInfo.Diagnostics{
-            .alloc = alloc,
-        };
-        defer diagnostics.deinit();
-
-        var elf_metadata = try elf.getElfMetadata(alloc, exe);
-        errdefer elf_metadata.deinit(alloc);
-
-        const dwarf_info = try debuginfo.DwarfInfo.init(alloc, exe, &diagnostics);
-
-        if (diagnostics.unhandled_fns.count() > 0) {
-            std.log.warn("Some fns have unhandled IP lookup", .{});
-            var key_it = diagnostics.unhandled_fns.keyIterator();
-
-            var string_buf = std.ArrayList(u8).init(alloc);
-            defer string_buf.deinit();
-            while (key_it.next()) |item| {
-                try string_buf.appendSlice(item.*);
-                try string_buf.appendSlice(", ");
-            }
-            std.log.debug("Function lookup will fail in: {s}", .{string_buf.items});
-        }
-
-        return .{
-            .alloc = alloc,
-            .exe = exe,
-            .elf_metadata = elf_metadata,
-            .dwarf_info = dwarf_info,
-        };
-    }
-
-    pub fn deinit(self: *Debugger) void {
-        self.breakpoints.deinit(self.alloc);
-        self.pending_breakpoints.deinit(self.alloc);
-        self.dwarf_info.deinit(self.alloc);
-        self.elf_metadata.deinit(self.alloc);
-    }
-
-    pub fn launch(self: *Debugger) !void {
-        const pid = try std.posix.fork();
-        if (pid == 0) {
-            try std.posix.ptrace(std.os.linux.PTRACE.TRACEME, 0, undefined, undefined);
-            std.posix.execveZ(self.exe, &.{null}, &.{null}) catch {
-                std.log.err("Exec error", .{});
-            };
-        } else {
-            self.pid = pid;
-        }
-    }
-
-    pub fn wait(self: *Debugger) !DebugStatus {
-        const ret = std.posix.waitpid(self.pid, 0);
-
-        if (!std.os.linux.W.IFSTOPPED(ret.status)) {
-            self.pid = 0;
-            return .finished;
-        }
-
-        var siginfo: std.os.linux.siginfo_t = undefined;
-        try std.posix.ptrace(std.os.linux.PTRACE.GETSIGINFO, self.pid, 0, @intFromPtr(&siginfo));
-
-        try std.posix.ptrace(std.os.linux.PTRACE.GETREGS, self.pid, 0, @intFromPtr(&self.regs));
-        self.last_signum = siginfo.signo;
-
-        try self.recoverFromBreakpoint();
-        try self.setPendingBreakpoints();
-
-        return .{
-            .stopped = .{
-                .siginfo = siginfo,
-            },
-        };
-    }
-
-    pub fn cont(self: *Debugger) !void {
-        try std.posix.ptrace(std.os.linux.PTRACE.SINGLESTEP, self.pid, 0, 0);
-        _ = try self.wait();
-
-        if (self.last_signum == std.os.linux.SIG.TRAP) {
-            try std.posix.ptrace(std.os.linux.PTRACE.CONT, self.pid, 0, 0);
-        } else {
-            try std.posix.ptrace(std.os.linux.PTRACE.CONT, self.pid, 0, @intCast(self.last_signum));
-        }
-    }
-
-    pub fn setBreakpoint(self: *Debugger, address: u64) !void {
-        const gop = try self.breakpoints.getOrPut(self.alloc, address);
-
-        var current_data: u64 = 0;
-        try std.posix.ptrace(std.os.linux.PTRACE.PEEKTEXT, self.pid, address, @intFromPtr(&current_data));
-
-        gop.value_ptr.* = @intCast(current_data & 0xff);
-
-        swapLeastSignificantByte(&current_data, int3);
-        try std.posix.ptrace(std.os.linux.PTRACE.POKETEXT, self.pid, address, current_data);
-    }
-
-    pub fn stepInstruction(self: *Debugger) !DebugStatus {
-        try std.posix.ptrace(std.os.linux.PTRACE.SINGLESTEP, self.pid, 0, 0);
-        return self.wait();
-    }
-
-    pub fn stepInto(self: *Debugger) !DebugStatus {
-        var start_loc = try self.sourceLocation();
-        defer start_loc.deinit(self.alloc);
-
-        while (true) {
-            const info = try self.stepInstruction();
-
-            // FIXME: sourceLocation is unbelievably expensive at this point
-            var current_loc = try self.sourceLocation();
-            defer current_loc.deinit(self.alloc);
-
-            if (current_loc.line == 0) {
-                continue;
-            }
-
-            if (!start_loc.eql(current_loc)) {
-                return info;
-            }
-        }
-    }
-
-    pub fn sourceLocation(self: *Debugger) !debuginfo.SourceLocation {
-        return try self.dwarf_info.sourceLocation(
-            self.alloc,
-            self.regs.rip,
-            self.getLineProgramSection(),
-        );
-    }
-
-    pub fn printLocals(self: *Debugger) !void {
-        const die = self.dwarf_info.getDieForInstruction(self.regs.rip);
-        const locals = try die.getLocals(self.alloc, &self.dwarf_info);
-        defer self.alloc.free(locals);
-        for (locals) |local| {
-            switch (local.op) {
-                .fbreg => |v| {
-                    // FIXME: rbp invalid if fomit-frame-pointer
-                    const address = addu64i64(self.regs.rbp, v);
-                    var val: u64 = 0;
-                    try std.posix.ptrace(std.os.linux.PTRACE.PEEKTEXT, self.pid, address, @intFromPtr(&val));
-
-                    if (local.type_size) |size| {
-                        const mask = ~@as(u64, 0) >> @intCast((8 - size) * 8);
-                        val = val & mask;
-                    }
-
-                    std.debug.print("\x1b[34mvar \x1b[35m{s}\x1b[m: {s} ({any}) = {x}\n", .{ local.name, local.type_name, local.type_size, val });
-                },
-                else => {
-                    std.debug.print("local {s} with unhandled op {any}\n", .{ local.name, local.op });
-                },
-            }
-        }
-    }
-
-    fn recoverFromBreakpoint(self: *Debugger) !void {
-        const entry = self.breakpoints.getEntry(self.regs.rip - 1) orelse return;
-
-        var current_data: u64 = 0;
-        try std.posix.ptrace(std.os.linux.PTRACE.PEEKTEXT, self.pid, entry.key_ptr.*, @intFromPtr(&current_data));
-
-        std.debug.assert(current_data & 0xff == int3); // Not interrupt
-
-        swapLeastSignificantByte(&current_data, entry.value_ptr.*);
-        try std.posix.ptrace(std.os.linux.PTRACE.POKETEXT, self.pid, entry.key_ptr.*, current_data);
-
-        self.regs.rip = entry.key_ptr.*;
-        try std.posix.ptrace(std.os.linux.PTRACE.SETREGS, self.pid, 0, @intFromPtr(&self.regs));
-
-        try self.pending_breakpoints.put(self.alloc, entry.key_ptr.*, {});
-        _ = self.breakpoints.remove(entry.key_ptr.*);
-    }
-
-    fn setPendingBreakpoints(self: *Debugger) !void {
-        var bp_it = self.pending_breakpoints.keyIterator();
-        var fixed_breakpoints = std.ArrayList(u64).init(self.alloc);
-        defer {
-            for (fixed_breakpoints.items) |bp| {
-                _ = self.pending_breakpoints.remove(bp);
-            }
-            fixed_breakpoints.deinit();
-        }
-
-        while (bp_it.next()) |bp| {
-            if (self.regs.rip != bp.*) {
-                try self.setBreakpoint(bp.*);
-                // FIXME: If append fails we might think the breakpoint is unset
-                try fixed_breakpoints.append(bp.*);
-            }
-        }
-    }
-
-    fn getLineProgramSection(self: *const Debugger) []const u8 {
-        return self.elf_metadata.di.sections[@intFromEnum(std.dwarf.DwarfSection.debug_line)].?.data;
-    }
-
-    fn swapLeastSignificantByte(val: *u64, new_least_sig: u8) void {
-        val.* &= ~@as(u64, 0xff);
-        val.* |= new_least_sig;
-    }
-};
 
 const Args = struct {
     breakpoint_names: []const []const u8,
@@ -324,9 +96,26 @@ pub fn main() !void {
     var args = try Args.parse(alloc);
     defer args.deinit(alloc);
 
+    //_ = c.runGui();
+
     var debugger = try Debugger.init(alloc, args.exe);
     defer debugger.deinit();
 
+    for (args.breakpoint_names, 0..) |name, i| {
+        const breakpoint = debugger.elf_metadata.fn_addresses.get(name) orelse {
+            std.debug.print("No fn with name {s}\n", .{name});
+            continue;
+        };
+
+        const offs = args.breakpoint_offsets[i];
+
+        // FIXME: API abuse
+        try debugger.pending_breakpoints.put(debugger.alloc, Debugger.addu64i64(breakpoint, offs), {});
+    }
+
+    try gui.run(alloc, &debugger);
+
+    if (true) return;
     try debugger.launch();
     while (true) {
         const status = try debugger.wait();
@@ -342,7 +131,7 @@ pub fn main() !void {
 
                         const offs = args.breakpoint_offsets[i];
 
-                        try debugger.setBreakpoint(addu64i64(breakpoint, offs));
+                        try debugger.setBreakpoint(Debugger.addu64i64(breakpoint, offs));
                     }
                     try debugger.cont();
                 } else {

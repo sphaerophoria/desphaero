@@ -21,7 +21,7 @@ fn doPrintLoop2(val: usize) void {
 }
 
 pub fn main() !void {
-    std.debug.print("Hello world\n", .{});
+    std.debug.print("\x1b[31mHello world\x1b[m\n", .{});
 
     for (0..5) |i| {
         doPrintLoop(i);
