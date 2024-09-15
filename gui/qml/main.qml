@@ -5,11 +5,11 @@ import sphaerophoria.desphaero 1.0
 
 ApplicationWindow {
     id: window
-    width: 800
-    height: 600
+    width: 540
+    height: 960
     visible: true
 
-    font.pointSize: 12
+    font.pointSize: 16
 
     SplitView {
         anchors.fill: parent
